@@ -32,6 +32,7 @@ def get_tensors(file_path):
         df_time.loc[:,'time_id'] = time_id
 
         df_time.ffill(axis = 0, inplace=True)
+        df_time.bfill(axis = 0, inplace=True)
 
         yield df_time.T.to_numpy(dtype=np.float32)
 

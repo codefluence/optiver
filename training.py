@@ -9,12 +9,12 @@ from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pytorch_lightning.callbacks import ModelCheckpoint
 
 from data import OptiverDataModule
-from model  import VolatilityClassifier
+from model  import VolatilityClassifier, PatternFinder
 
 def fit_model():
 
     data = OptiverDataModule()
-    model = VolatilityClassifier()
+    model = PatternFinder()
 
     filename = 'optiver-{epoch}-{val_rmspe:.4f}'
     dirpath='./weights/'
