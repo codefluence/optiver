@@ -36,17 +36,16 @@ class OptiverDataModule(pl.LightningDataModule):
         tensors = np.load(ROOT_DATA+'cache/optiver_tensors.npz')
 
         b = tensors['books']  # (428932, 11, 600)
-        #t = tensors['trades']
         self.targets = tensors['truth']
 
-        NUM_SERIES = 4
+        NUM_SERIES = 8
         s = np.repeat(np.nan, b.shape[0] * NUM_SERIES * b.shape[2]).reshape(b.shape[0], NUM_SERIES, b.shape[2]).astype(np.float32)
 
-        NUM_STATS = 1
+        NUM_STATS = 9
         self.stats = np.repeat(np.nan, b.shape[0] * NUM_STATS).reshape(b.shape[0], NUM_STATS).astype(np.float32)
 
         # 2 bid_price1  
-        # 3 ask_price1  #offer
+        # 3 ask_price1
         # 4 bid_price2  
         # 5 ask_price2 
 
@@ -60,50 +59,81 @@ class OptiverDataModule(pl.LightningDataModule):
         # WAP ("valuation" price)
         s[:,0] = (b[:,2]*b[:,7] + b[:,3]*b[:,6]) / (b[:,6] + b[:,7])
 
-        # Spread
+        # Price spread
         s[:,1] = b[:,3] / b[:,2] - 1
 
         # Log-returns
         s[:,2] = np.diff(np.log(s[:,0]), prepend=0)  # TODO: double-check prepend
 
         # Alternative to spread that takes into account the second level
-        s[:,3] = (b[:,3]*b[:,7] + b[:,5]* b[:,9]) / (b[:,7] + b[:,9]) /    \
-                 (b[:,2]*b[:,6] + b[:,6]* b[:,8]) / (b[:,6] + b[:,8])  -  1
+        s[:,3] = ((b[:,3]*b[:,7] + b[:,5]* b[:,9]) / (b[:,7] + b[:,9])) /    \
+                 ((b[:,2]*b[:,6] + b[:,6]* b[:,8]) / (b[:,6] + b[:,8]))  -  1
 
-        # # "Liquid" WAP
-        # s[:,4] = (b[:,2]*b[:,7] + b[:,3]*b[:,6] + b[:,2]*b[:,7] + b[:,3]*b[:,6]) / (b[:,6] + b[:,7] + b[:,8] + b[:,9])
+        # "deeper" WAP
+        t_bid_size = b[:,6] + b[:,8]
+        t_ask_size = b[:,7] + b[:,9]
+        w_avg_bid_price = (b[:,2]*b[:,6] + b[:,4]*b[:,8]) / t_bid_size
+        w_avg_ask_price = (b[:,3]*b[:,7] + b[:,5]*b[:,9]) / t_ask_size
+        deeperWAP = (w_avg_bid_price * t_ask_size + w_avg_ask_price * t_bid_size) / (t_bid_size + t_ask_size)
+        deeperLogReturns = np.diff(np.log(deeperWAP), prepend=0)  # TODO: double-check prepend
 
+        # Spread between WAP and deeperWAP
+        s[:,4] = s[:,0] / deeperWAP - 1
+
+        # Spread between returns
+        s[:,5] = (s[:,2] + 0.00001) / (deeperLogReturns + 0.00001) - 1
+
+        # Volumne imbalance
+        s[:,6] = (t_ask_size + 0.00001) / (t_bid_size + 0.00001) - 1
+
+        # Volumne sum   TODO
+        s[:,7] = t_ask_size + t_bid_size 
+        # the value of a unit is different for every stock, but still the shape of the series might be useful
+
+        ###############################################################################
+
+        #TRADES: returs, real volatility
    
-        for i in range(NUM_SERIES):
-
-            scaler = MinMaxScaler().fit(s[:,i].T)
-            s[:,i] = scaler.transform(s[:,i].T).T
-
-        self.series = s
+        ###############################################################################
 
         print('computing stats...')
         # Realized volatility
-        self.stats[:,0] = np.apply_along_axis(lambda x : np.sqrt(np.sum(x**2)), 1, s[:,2])
-        # self.stats[:,1] = np.apply_along_axis(lambda x : np.sqrt(np.sum(x**2)), 1, s[:,2,:300])
-        # self.stats[:,2] = np.apply_along_axis(lambda x : np.sqrt(np.sum(x**2)), 1, s[:,2,:100])
+        # self.stats[:,0] = np.apply_along_axis(lambda x : np.sqrt(np.sum(x**2)), 1, s[:,2])
+        # self.stats[:,1] = np.apply_along_axis(lambda x : np.sqrt(np.sum(x**2)), 1, s[:,2,-300:])
+        # self.stats[:,2] = np.apply_along_axis(lambda x : np.sqrt(np.sum(x**2)), 1, s[:,2,-100:])
 
         # # Realized volatility trend
-        # self.stats[:,3] = np.apply_along_axis(lambda x : np.sqrt(np.sum(x[300:]**2)) - np.sqrt(np.sum(x[:300]**2)), 1, s[:,2])
-        # self.stats[:,4] = np.apply_along_axis(lambda x : np.sqrt(np.sum(x[450:]**2)) - np.sqrt(np.sum(x[300:450]**2)), 1, s[:,2])
-        # self.stats[:,5] = np.apply_along_axis(lambda x : np.sqrt(np.sum(x[50:]**2)) - np.sqrt(np.sum(x[500:]**2)), 1, s[:,2])
+        # self.stats[:,3] = np.apply_along_axis(lambda x : np.sqrt(np.sum(x[-300:]**2)) - np.sqrt(np.sum(x[:300]**2)), 1, s[:,2])
+        # self.stats[:,4] = np.apply_along_axis(lambda x : np.sqrt(np.sum(x[-150:]**2)) - np.sqrt(np.sum(x[-300:-150]**2)), 1, s[:,2])
+        # self.stats[:,5] = np.apply_along_axis(lambda x : np.sqrt(np.sum(x[-50:]**2)) - np.sqrt(np.sum(x[-100:-50]**2)), 1, s[:,2])
 
         # # Spread trend
-        # self.stats[:,6] = np.apply_along_axis(lambda x : np.mean(x[300:]) - np.mean(x[:300]), 1, s[:,1])
-        # self.stats[:,7] = np.apply_along_axis(lambda x : np.mean(x[450:]) - np.mean(x[300:450]), 1, s[:,1])
-        # self.stats[:,8] = np.apply_along_axis(lambda x : np.mean(x[50:]) - np.mean(x[500:]), 1, s[:,1])
+        # self.stats[:,6] = np.apply_along_axis(lambda x : np.mean(x[-300:]) - np.mean(x[:300]), 1, s[:,1])
+        # self.stats[:,7] = np.apply_along_axis(lambda x : np.mean(x[-150:]) - np.mean(x[-300:-150]), 1, s[:,1])
+        # self.stats[:,8] = np.apply_along_axis(lambda x : np.mean(x[-50:]) - np.mean(x[-100:-50]), 1, s[:,1])
 
         #TODO: normalize stats?
+
+        #TODO: 'sum', 'mean', 'std', 'max', 'min'
+
+        ###############################################################################
+
+        print('scaling...')
+
+        # for i in range(NUM_SERIES):
+
+        #     scaler = MinMaxScaler().fit(s[:,i].T)
+        #     s[:,i] = scaler.transform(s[:,i].T).T
+
+        self.series = s
 
         assert(np.isnan(self.series).sum() == 0)
         assert(np.isinf(self.series).sum() == 0)
 
-        assert(np.isnan(self.stats).sum() == 0)
-        assert(np.isinf(self.stats).sum() == 0)
+        # assert(np.isnan(self.stats).sum() == 0)
+        # assert(np.isinf(self.stats).sum() == 0)
+
+        self.t = tensors['trades']
 
         print('data ready')
 
