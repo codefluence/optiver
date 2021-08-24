@@ -18,8 +18,6 @@ from sklearn.preprocessing import MinMaxScaler
 ROOT_DATA = 'D:/data/optiver/'
 
 
-# some commonly seen technical signals of the financial market are derived from trade data directly, such as high-low or total traded volume.
-
 class OptiverDataModule(pl.LightningDataModule):
 
     def __init__(self):
@@ -44,63 +42,91 @@ class OptiverDataModule(pl.LightningDataModule):
         NUM_STATS = 9
         self.stats = np.repeat(np.nan, b.shape[0] * NUM_STATS).reshape(b.shape[0], NUM_STATS).astype(np.float32)
 
-        # 2 bid_price1  
-        # 3 ask_price1
-        # 4 bid_price2  
-        # 5 ask_price2 
+        epsilon = 0.00001
 
-        # 6 bid_size1  
-        # 7 ask_size1  
-        # 8 bid_size2  
-        # 9 ask_size2
+        bid_px1 = b[:,2]
+        ask_px1 = b[:,3]
+        bid_px2 = b[:,4]
+        ask_px2 = b[:,5]
+
+        bid_qty1 = b[:,6]
+        ask_qty1 = b[:,7]
+        bid_qty2 = b[:,8]
+        ask_qty2 = b[:,9]
+
+        t_bid_size = bid_qty1 + bid_qty2
+        t_ask_size = ask_qty1 + ask_qty2
+
+        w_avg_bid_price = (bid_px1*bid_qty1 + bid_px2*bid_qty2) / t_bid_size
+        w_avg_ask_price = (ask_px1*ask_qty1 + ask_px2*ask_qty2) / t_ask_size
 
         print('computing series...')
 
-        # WAP ("valuation" price)
-        s[:,0] = (b[:,2]*b[:,7] + b[:,3]*b[:,6]) / (b[:,6] + b[:,7])
+        WAP = (bid_px1*ask_qty1 + ask_px1*bid_qty1) / (bid_qty1 + ask_qty1)
 
-        # Price spread
-        s[:,1] = b[:,3] / b[:,2] - 1
+        spread = ask_px1 / bid_px1 - 1  # TODO: mejor formula para el spread?
 
-        # Log-returns
-        s[:,2] = np.diff(np.log(s[:,0]), prepend=0)  # TODO: double-check prepend
+        log_returns = np.diff(np.log(WAP), prepend=0)  # TODO: double-check prepend
 
-        # Alternative to spread that takes into account the second level
-        s[:,3] = ((b[:,3]*b[:,7] + b[:,5]* b[:,9]) / (b[:,7] + b[:,9])) /    \
-                 ((b[:,2]*b[:,6] + b[:,6]* b[:,8]) / (b[:,6] + b[:,8]))  -  1
+        # deepSpread: Alternative to spread that takes into account the second level
+        deep_spread = w_avg_ask_price / w_avg_bid_price  -  1
 
-        # "deeper" WAP
-        t_bid_size = b[:,6] + b[:,8]
-        t_ask_size = b[:,7] + b[:,9]
-        w_avg_bid_price = (b[:,2]*b[:,6] + b[:,4]*b[:,8]) / t_bid_size
-        w_avg_ask_price = (b[:,3]*b[:,7] + b[:,5]*b[:,9]) / t_ask_size
-        deeperWAP = (w_avg_bid_price * t_ask_size + w_avg_ask_price * t_bid_size) / (t_bid_size + t_ask_size)
-        deeperLogReturns = np.diff(np.log(deeperWAP), prepend=0)  # TODO: double-check prepend
+        deepWAP = (w_avg_bid_price * t_ask_size + w_avg_ask_price * t_bid_size) / (t_bid_size + t_ask_size)
 
-        # Spread between WAP and deeperWAP
-        s[:,4] = s[:,0] / deeperWAP - 1
+        deep_log_returns = np.diff(np.log(deepWAP), prepend=0)  # TODO: double-check prepend
 
-        # Spread between returns
-        s[:,5] = (s[:,2] + 0.00001) / (deeperLogReturns + 0.00001) - 1
+        #TODO: diff between spread and deepSpread, etc en lugar de lo anterior?
+        WAPdev = WAP / deepWAP - 1
+        log_returns_dev = (log_returns + epsilon) / (deep_log_returns + epsilon) - 1
+        spread_dev = (spread + epsilon) / (deep_spread + epsilon) - 1
 
-        # Volumne imbalance
-        s[:,6] = (t_ask_size + 0.00001) / (t_bid_size + 0.00001) - 1
+        vol_imbalance = (t_ask_size + epsilon) / (t_bid_size + epsilon) - 1
 
-        # Volumne sum   TODO
-        s[:,7] = t_ask_size + t_bid_size 
+        vol_sum = t_ask_size + t_bid_size 
         # the value of a unit is different for every stock, but still the shape of the series might be useful
+        #TODO: normalizar volumenes absolutos
+
+        # sliding_window_view not available for numpy < 1.20
+        windows = torch.Tensor(log_returns).unfold(1,30,6).detach().numpy()
+        moving_realized_volatility = np.std(windows, axis=1)
+        # moving_realized_volatility = np.apply_along_axis(lambda x: np.sqrt(np.sum(x**2)), arr=windows, axis=2)
 
         ###############################################################################
 
-        #TRADES: returs, real volatility
+        t = tensors['trades']
+
+        last_wavg_px = t[:,2]
+        executed_qty = t[:,3]
+        executed_count = t[:,4]
+
+        # At the beginning of the window there is no "last execution" carried from previous time, we use WAP instead 
+        last_wavg_px = np.nan_to_num(last_wavg_px) + np.isnan(last_wavg_px) * np.nan_to_num(WAP)
+
+        s[:,4] = WAP / last_wavg_px - 1
+        s[:,4] = deepWAP / last_wavg_px - 1
+
+        last_log_returns = np.diff(np.log(last_wavg_px), prepend=0)  # TODO: double-check prepend
+
+        log_returns_dev2 = (log_returns + epsilon) / (last_log_returns + epsilon) - 1
+
+        s = np.vstack((WAP,spread,log_returns,deep_spread,deepWAP,deep_log_returns,WAPdev,
+                       log_returns_dev,spread_dev,vol_imbalance,vol_sum,moving_realized_volatility,
+                       last_wavg_px,last_log_returns,log_returns_dev2))
    
+        ###############################################################################
+
+        # technical analysis
+
+
+
         ###############################################################################
 
         print('computing stats...')
         # Realized volatility
-        # self.stats[:,0] = np.apply_along_axis(lambda x : np.sqrt(np.sum(x**2)), 1, s[:,2])
+        self.stats[:,0] = np.apply_along_axis(lambda x : np.sqrt(np.sum(x**2)), 1, s[:,2])
         # self.stats[:,1] = np.apply_along_axis(lambda x : np.sqrt(np.sum(x**2)), 1, s[:,2,-300:])
         # self.stats[:,2] = np.apply_along_axis(lambda x : np.sqrt(np.sum(x**2)), 1, s[:,2,-100:])
+        #TODO: repetir con trades
 
         # # Realized volatility trend
         # self.stats[:,3] = np.apply_along_axis(lambda x : np.sqrt(np.sum(x[-300:]**2)) - np.sqrt(np.sum(x[:300]**2)), 1, s[:,2])
@@ -132,8 +158,6 @@ class OptiverDataModule(pl.LightningDataModule):
 
         # assert(np.isnan(self.stats).sum() == 0)
         # assert(np.isinf(self.stats).sum() == 0)
-
-        self.t = tensors['trades']
 
         print('data ready')
 
