@@ -9,7 +9,7 @@ from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pytorch_lightning.callbacks import ModelCheckpoint
 
 from data import OptiverDataModule
-from model  import VolatilityClassifier, PatternFinder
+from model import VolatilityClassifier, PatternFinder
 
 def fit_model():
 
