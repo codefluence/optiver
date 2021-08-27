@@ -53,30 +53,50 @@ class OptiverDataModule(pl.LightningDataModule):
         books_series[:,9] = np.nan_to_num(books_series[:,9])
         books_series[:,10] = np.nan_to_num(books_series[:,10])
 
-        windows = torch.Tensor(WAP).unfold(1,30,1)
+        windows = torch.Tensor(WAP).unfold(1,kernel_size,1)
         moving_mean = torch.mean(windows, axis=2)
         moving_std  = torch.std(windows, axis=2)
+        moving_min  = torch.min(windows, axis=2)
+        moving_max  = torch.max(windows, axis=2)
 
         series = nn.AvgPool1d(kernel_size=kernel_size, stride=stride)(torch.Tensor(books_series)).cuda()
-        moving_mean = nn.AvgPool1d(kernel_size=kernel_size, stride=stride)(moving_mean.unsqueeze(0)).cuda()
-        moving_std = nn.AvgPool1d(kernel_size=kernel_size, stride=stride)(moving_std.unsqueeze(0)).cuda()
+        moving_mean = nn.AvgPool1d(kernel_size=kernel_size, stride=stride)(moving_mean.unsqueeze(0)).squeeze().cuda()
+        moving_std = nn.AvgPool1d(kernel_size=kernel_size, stride=stride)(moving_std.unsqueeze(0)).squeeze().cuda()
+        moving_min = nn.AvgPool1d(kernel_size=kernel_size, stride=stride)(moving_min).cuda()
+        moving_max = nn.AvgPool1d(kernel_size=kernel_size, stride=stride)(moving_max).cuda()
 
         books_series = None
         gc.collect()
 
-        bid_px1 = series[:,0]
-        ask_px1 = series[:,1]
-        bid_px2 = series[:,2]
-        ask_px2 = series[:,3]
-        bid_qty1 = series[:,4]
-        ask_qty1 = series[:,5]
-        bid_qty2 = series[:,6]
-        ask_qty2 = series[:,7]
-        last_wavg_px = series[:,8]
-        executed_qty = series[:,9]
-        executed_count = series[:,10]
+        bid_px1 = series[:,0,-91:]
+        ask_px1 = series[:,1,-91:]
+        bid_px2 = series[:,2,-91:]
+        ask_px2 = series[:,3,-91:]
+        bid_qty1 = series[:,4,-91:]
+        ask_qty1 = series[:,5,-91:]
+        bid_qty2 = series[:,6,-91:]
+        ask_qty2 = series[:,7,-91:]
+        last_wavg_px = series[:,8,-91:]
+        executed_qty = series[:,9,-91:]
+        executed_count = series[:,10,-91:]
 
         print('computing series...')
+
+        ################################## Technical analysis ##################################
+
+        WAP = (bid_px1*ask_qty1 + ask_px1*bid_qty1) / (bid_qty1 + ask_qty1)
+
+        bollinger_deviation = (moving_mean.squeeze() - WAP) / (moving_std.squeeze() + epsilon)
+
+        moving_range_diff = moving_max - moving_min  ### <----- problem
+        keltner_deviation = (moving_mean.squeeze() - WAP) / (moving_range_diff.squeeze() + epsilon)
+
+        donchian_deviation = 2 * WAP / (moving_max + moving_min) - 1
+
+        #avg_true_range = torch.split(grouped_x[sorted_idx], chunk_size, dim=0)
+
+
+        ######################################################################################################
 
         bOF1 = self.get_orderflow(bid_px1, bid_qty1)
         bOF2 = self.get_orderflow(bid_px2, bid_qty2)
@@ -108,20 +128,6 @@ class OptiverDataModule(pl.LightningDataModule):
         # vol_sum = t_ask_size + t_bid_size 
         # # the value of a unit is different for every stock, but still the shape of the series might be useful
         # #TODO: normalizar volumenes absolutos
-
-        ################################## Technical analysis ##################################
-
-        # windows = torch.Tensor(log_returns).unfold(1,30,1).detach().numpy()
-        # moving_realized_volatility = np.std(windows, axis=1)
-        # sliding_window_view not available for numpy < 1.20
-        #moving_realized_volatility = np.apply_along_axis(lambda x: np.sqrt(np.sum(x**2)), arr=windows, axis=2)
-
-        # windows = torch.Tensor(WAP).unfold(1,20,1).detach().numpy()
-        # moving_std = np.std(windows, axis=2)
-        # moving_mean = np.mean(windows, axis=2)
-
-        # WAP[0,-581:] > (moving_mean[0] + moving_std[0]*20)
-        # WAP[0,-581:] < (moving_mean[0] - moving_std[0]*20)
 
         ######################################## Trades ########################################
 
@@ -293,6 +299,9 @@ class SeriesDataSet(Dataset):
 
 
 if __name__ == '__main__':
+
+        # sliding_window_view not available for numpy < 1.20
+        # moving_realized_volatility = np.apply_along_axis(lambda x: np.sqrt(np.sum(x**2)), arr=windows, axis=2)
 
     data = OptiverDataModule()
 
