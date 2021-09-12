@@ -42,8 +42,8 @@ def fit_model():
     trainer = pl.Trainer(   logger=pl_loggers.TensorBoardLogger('./logs/'),
                             gpus=1,
                             max_epochs=100,
-                            checkpoint_callback=checkpoint_callback,
-                            callbacks=[early_stop_callback] )
+                            checkpoint_callback=True,
+                            callbacks=[early_stop_callback,checkpoint_callback] )
 
     torch.manual_seed(0)
     np.random.seed(0)
