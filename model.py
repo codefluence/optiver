@@ -15,31 +15,36 @@ from utils import blend, smooth_bce, utility_score
 
 class PatternFinder(LightningModule):
 
-    def __init__(self, in_channels=4, multf=4):
+    def __init__(self, in_channels=4, multf=2):
 
         super(PatternFinder, self).__init__()
 
         #TODO: anadir uno o varios canales con ruido
 
+        #TODO: probar dos cosas:
+        # - dos convoluciones: ultimo tramo y todo pero con el tiempo corriendo cada vez mas lento
+        # - primera derivada
+
+        #TODO: hay que visualizar para ver que podemos hacer
+
         self.batchnorm = nn.BatchNorm1d(in_channels)
 
-        # self.avgpool_a = nn.AvgPool1d(kernel_size=30, stride=6)
         # self.avgpool_b = nn.AvgPool1d(kernel_size=15, stride=3)
         # self.avgpool_c = nn.AvgPool1d(kernel_size=5, stride=1)
         
-        self.conv1_a = nn.Conv1d(in_channels, in_channels*multf, kernel_size=5, stride=3, padding=0, bias=True)
-        self.conv2_a = nn.Conv1d(in_channels*multf, in_channels*multf*2, kernel_size=5, stride=3, padding=0, bias=True)
-        self.conv3_a = nn.Conv1d(in_channels*multf*2, in_channels*multf*2*2, kernel_size=5, stride=3, padding=0, bias=True)
+        self.conv1_a = nn.Conv1d(in_channels, in_channels*multf, kernel_size=3, stride=3, padding=0, bias=True)
+        self.conv2_a = nn.Conv1d(in_channels*multf, in_channels*multf*2, kernel_size=3, stride=3, padding=0, bias=True)
+        self.conv3_a = nn.Conv1d(in_channels*multf*2, in_channels*multf*2*2, kernel_size=3, stride=3, padding=0, bias=True)
 
-        # self.conv1_b = nn.Conv1d(in_channels, in_channels*multf, kernel_size=5, padding=1, bias=True)
-        # self.conv2_b = nn.Conv1d(in_channels*multf, in_channels*multf*2, kernel_size=5, padding=1, bias=True)
-        # self.conv3_b = nn.Conv1d(in_channels*multf*2, in_channels, kernel_size=5, padding=1, bias=True)
+        self.conv1_b = nn.Conv1d(in_channels, in_channels*multf, kernel_size=2, stride=2, padding=0, bias=True)
+        self.conv2_b = nn.Conv1d(in_channels*multf, in_channels*multf*2, kernel_size=3, stride=3, padding=0, bias=True)
+        self.conv3_b = nn.Conv1d(in_channels*multf*2, in_channels*multf*2*2, kernel_size=3, stride=3, padding=0, bias=True)
 
-        # self.conv1_c = nn.Conv1d(in_channels, in_channels*multf, kernel_size=5, padding=1, bias=True)
-        # self.conv2_c = nn.Conv1d(in_channels*multf, in_channels*multf*2, kernel_size=5, padding=1, bias=True)
-        # self.conv3_c = nn.Conv1d(in_channels*multf*2, in_channels, kernel_size=5, padding=1, bias=True)
+        self.conv1_c = nn.Conv1d(in_channels, in_channels*multf, kernel_size=2, stride=2, padding=0, bias=True)
+        self.conv2_c = nn.Conv1d(in_channels*multf, in_channels*multf*2, kernel_size=2, stride=2, padding=0, bias=True)
+        self.conv3_c = nn.Conv1d(in_channels*multf*2, in_channels*multf*2*2, kernel_size=2, stride=2, padding=0, bias=True)
 
-        self.linear = nn.Linear(in_channels*multf*2*2,1)  #3*4*96  # 3*in_channels*90, 1
+        self.linear = nn.Linear(in_channels*multf*2*2*3,1)  #in_channels*multf*2*2
 
         self.loss = nn.MSELoss()
 
@@ -47,13 +52,9 @@ class PatternFinder(LightningModule):
 
         x = self.batchnorm(series)
     
-        # x_a = self.avgpool_a(x)
-        # x_b = self.avgpool_b(x[:,:,-50:])
-        # x_c = self.avgpool_c(x[:,:,-25:])
-
         x_a = x
-        # x_b = x[:,:,-50:]
-        # x_c = x[:,:,-25:]
+        x_b = x[:,:,-60:]
+        x_c = x[:,:,-30:]
 
         x_a = self.conv1_a(x_a)
         x_a = F.leaky_relu(x_a)
@@ -62,29 +63,31 @@ class PatternFinder(LightningModule):
         x_a = self.conv3_a(x_a)
         x_a = F.leaky_relu(x_a)
 
-        # x_b = self.conv1_b(x_b)
-        # x_b = F.leaky_relu(x_b)
-        # x_b = self.conv2_b(x_b)
-        # x_b = F.leaky_relu(x_b)
-        # x_b = self.conv3_b(x_b)
-        # x_b = F.leaky_relu(x_b)
+        x_b = self.conv1_b(x_b)
+        x_b = F.leaky_relu(x_b)
+        x_b = self.conv2_b(x_b)
+        x_b = F.leaky_relu(x_b)
+        x_b = self.conv3_b(x_b)
+        x_b = F.leaky_relu(x_b)
 
-        # x_c = self.conv1_c(x_c)
-        # x_c = F.leaky_relu(x_c)
-        # x_c = self.conv2_c(x_c)
-        # x_c = F.leaky_relu(x_c)
-        # x_c = self.conv3_c(x_c)
-        # x_c = F.leaky_relu(x_c)
+        x_c = self.conv1_c(x_c)
+        x_c = F.leaky_relu(x_c)
+        x_c = self.conv2_c(x_c)
+        x_c = F.leaky_relu(x_c)
+        x_c = self.conv3_c(x_c)
+        x_c = F.leaky_relu(x_c)
 
         x_a = x_a[:,:,1] - x_a[:,:,0]
-        #x_a = torch.flatten(x_a, start_dim=1, end_dim=2)
+        x_b = x_b[:,:,1] - x_b[:,:,0]
+        x_c = x_c[:,:,1] - x_c[:,:,0]
 
+        # x_a = torch.flatten(x_a, start_dim=1, end_dim=2)
         # x_b = torch.flatten(x_b, start_dim=1, end_dim=2)
         # x_c = torch.flatten(x_c, start_dim=1, end_dim=2)
 
-        # x = torch.hstack((x_a, x_b, x_c))
+        x = torch.hstack((x_a, x_b, x_c))
 
-        return self.linear(x_a), x_a
+        return self.linear(x), x
 
     def training_step(self, train_batch, batch_idx):
 
@@ -116,7 +119,7 @@ class PatternFinder(LightningModule):
 
     def configure_optimizers(self):
 
-        optimizer = torch.optim.Adam(self.parameters(), lr=3e-3)
+        optimizer = torch.optim.Adam(self.parameters(), lr=3e-4)
         sccheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=2, factor=1/5, verbose=True, min_lr=1e-5)
         return [optimizer], {'scheduler': sccheduler, 'monitor': 'val_rmspe'}
 

@@ -1,6 +1,7 @@
 import os
 import gc
 import json
+import math
 from tqdm import tqdm
 
 import pandas as pd
@@ -42,9 +43,10 @@ class OptiverDataModule(pl.LightningDataModule):
         print('loading cached data...')
         tensors = np.load(self.settings['ROOT_DATA'] + 'cache/optiver_series.npz')
 
-        self.targets = tensors['targets']
+        self.targets = tensors['targets'].astype(np.float32)
 
-        series = tensors['series']  # shape(428932, 11, 600)
+        #TODO: get_time_series debe guardar en np.float32
+        series = tensors['series'].astype(np.float32)  # shape(428932, 11, 600)
         #TODO: mover a get_time_series:
         series[:,9] = np.nan_to_num(series[:,9])
         series[:,10] = np.nan_to_num(series[:,10])
@@ -53,18 +55,23 @@ class OptiverDataModule(pl.LightningDataModule):
         ask_px1 = series[:,1]
         bid_px2 = series[:,2]
         ask_px2 = series[:,3]
+
         bid_qty1 = series[:,4]
         ask_qty1 = series[:,5]
         bid_qty2 = series[:,6]
         ask_qty2 = series[:,7]
-        last_wavg_px = series[:,8]
+
+        executed_px = series[:,8]
         executed_qty = series[:,9]
         executed_count = series[:,10]
 
         series = None
 
+        print('processing series...')
+
         sumexecs = self.targets[:,:2].copy()
         sumexecs[:,1] = np.sum(executed_qty, axis=1)
+
         sumexecs_means = sumexecs.copy()
 
         for i in np.unique(sumexecs[:,0]):
@@ -73,15 +80,29 @@ class OptiverDataModule(pl.LightningDataModule):
         sumexecs = sumexecs[:,1:2]
         sumexecs_means = sumexecs_means[:,1:2]
 
-        def squeeze(array):
-            
-            return nn.AvgPool1d(kernel_size=kernel_size, stride=stride)(torch.Tensor(array).cuda().unsqueeze(0)).squeeze()
+        def reduce(array, log=''):
 
-        executed_qty_dist =  squeeze(np.divide(executed_qty, sumexecs))
-        executed_count_dist = squeeze(np.divide(executed_count, np.expand_dims(np.sum(executed_count,axis=1),axis=1)))
+            a = nn.AvgPool1d(kernel_size=kernel_size, stride=stride)(torch.Tensor(array).cuda().unsqueeze(0)).squeeze().cpu().numpy()
+
+            copy = a.copy()
+
+            del a
+            torch.cuda.empty_cache()
+
+            assert(np.isnan(copy).sum() == 0)
+            assert(np.isinf(copy).sum() == 0)
+
+            print(log, '\tmin:', np.round(np.min(copy),5), '\tmax:', np.round(np.max(copy),5))
+
+            return copy
+
+        # executed_qty_dist =  reduce(np.divide(executed_qty, sumexecs))
+        # executed_count_dist = reduce(np.divide(executed_count, np.expand_dims(np.sum(executed_count,axis=1),axis=1)))
         executed_count = None
 
         def get_orderflow(prices, qties):
+
+            torch.cuda.empty_cache()
 
             prices = torch.Tensor(prices).cuda()
             qties = torch.Tensor(qties / sumexecs_means).cuda()
@@ -89,130 +110,190 @@ class OptiverDataModule(pl.LightningDataModule):
             price_diff = torch.diff(prices)
             vol_diff   = torch.diff(qties)
 
-            vol_diff[price_diff > 0] = qties[:,1:][price_diff > 0]
-            vol_diff[price_diff < 0] = qties[:,1:][price_diff < 0] * -1
+            of = (price_diff == 0) * vol_diff + \
+                 (price_diff > 0)  * qties[:,1:] + \
+                 (price_diff < 0)  * torch.roll(qties * -1, 1, 1)[:,1:]
 
-            return vol_diff
+            return of.cpu().numpy()
 
-        bOF1 = get_orderflow(bid_px1, bid_qty1)
-        aOF1 = get_orderflow(ask_px1, ask_qty1)
-        OFI1 = bOF1 - aOF1
-        bOF1 = None#nn.AvgPool1d(kernel_size=kernel_size, stride=stride)(bOF1.unsqueeze(0)).squeeze()
-        aOF1 = None#nn.AvgPool1d(kernel_size=kernel_size, stride=stride)(aOF1.unsqueeze(0)).squeeze()
-        OFI1 = nn.AvgPool1d(kernel_size=kernel_size, stride=stride)(OFI1.unsqueeze(0)).squeeze()
-
-        bOF2 = get_orderflow(bid_px2, bid_qty2)
-        aOF2 = get_orderflow(ask_px2, ask_qty2)
-        OFI2 = bOF2 - aOF2
-        bOF2 = None#nn.AvgPool1d(kernel_size=kernel_size, stride=stride)(bOF2.unsqueeze(0)).squeeze()
-        aOF2 = None#nn.AvgPool1d(kernel_size=kernel_size, stride=stride)(aOF2.unsqueeze(0)).squeeze()
-        OFI2 = nn.AvgPool1d(kernel_size=kernel_size, stride=stride)(OFI2.unsqueeze(0)).squeeze()
-
-        # bOF1 = None
-        # aOF1 = None
-        # bOF2 = None
-        # aOF2 = None
+        OFI1 = reduce(get_orderflow(bid_px1, bid_qty1) - get_orderflow(ask_px1, ask_qty1), 'OFI1   ')
+        OFI2 = reduce(get_orderflow(bid_px2, bid_qty2) - get_orderflow(ask_px2, ask_qty2), 'OFI2   ')
 
         torch.cuda.empty_cache()
 
-        bid_px2 = squeeze(bid_px2)
-        ask_px2 = squeeze(ask_px2)
-        bid_qty2 = squeeze(bid_qty2)
-        ask_qty2 = squeeze(ask_qty2)
+        bid_px2 = reduce(bid_px2, 'bid_px2')
+        ask_px2 = reduce(ask_px2, 'ask_px2')
+        bid_qty2 = reduce(bid_qty2, 'bid_qty2')
+        ask_qty2 = reduce(ask_qty2, 'ask_qty2')
 
         gc.collect()
 
         WAP = (bid_px1*ask_qty1 + ask_px1*bid_qty1) / (bid_qty1 + ask_qty1)
-        last_wavg_px = np.nan_to_num(last_wavg_px) + np.isnan(last_wavg_px) * np.nan_to_num(WAP)
+        executed_px = np.nan_to_num(executed_px) + np.isnan(executed_px) * np.nan_to_num(WAP)
+        
         log_returns = np.diff(np.log(WAP))
+        log_returns = reduce(log_returns, 'log_returns')
 
-        bid_px1 = squeeze(bid_px1)
-        ask_px1 = squeeze(ask_px1)
-        bid_qty1 = squeeze(bid_qty1)
-        ask_qty1 = squeeze(ask_qty1)
+        bid_px1 = reduce(bid_px1, 'bid_px1')
+        ask_px1 = reduce(ask_px1, 'ask_px1')
+        bid_qty1 = reduce(bid_qty1, 'bid_qty1')
+        ask_qty1 = reduce(ask_qty1, 'ask_qty1')
 
         gc.collect()
+        torch.cuda.empty_cache()
 
-        ##################################################################
+        ################################ Inspired on Technical Analysis ################################
 
-        # #https://www.investopedia.com/terms/o/onbalancevolume.asp
-        # OBV_diff = (executed_qty[:,1:] * (np.diff(last_wavg_px) > 0)) - (executed_qty[:,1:] * (np.diff(last_wavg_px) < 0))
-        # #TODO: Remove units
+        # Inspired on https://www.investopedia.com/terms/o/onbalancevolume.asp
+        OBV = ((executed_qty[:,1:] * (np.diff(executed_px) > 0)) - (executed_qty[:,1:] * (np.diff(executed_px) < 0))) / sumexecs_means
+        OBV = reduce(OBV, 'OBV    ')
 
-        # #https://www.investopedia.com/terms/f/force-index.asp
-        # force_index = np.diff(last_wavg_px) * executed_qty[:,1:]
-        # #TODO: Remove units, agregar 2 veces? dividir por la media de exec_qty * price de los ultismos 30 secs?
+        # Inspired on https://www.investopedia.com/terms/f/force-index.asp
+        force_index = np.diff(np.log(executed_px)) * executed_qty[:,1:] * 1e5 / sumexecs_means
+        force_index = reduce(force_index, 'force_ix')
 
-        # executed_qty_windows = torch.Tensor(executed_qty).unfold(1,kernel_size,1)
+        # TODO: ??????????
+        # executed_qty_windows = torch.Tensor(executed_qty).cuda().unfold(1,kernel_size,1)
         # moving_executed_qty = torch.mean(executed_qty_windows, axis=2)
-        # effort = (executed_qty[:,-541:] / log_returns[:,-541:]) / moving_executed_qty
+        # effort = (executed_qty[:,1:] / log_returns) / moving_executed_qty
         # effort = torch.Tensor(np.nan_to_num(effort))
         # effort = nn.AvgPool1d(kernel_size=kernel_size, stride=stride)(effort.unsqueeze(0)).squeeze().cpu()
 
 
-        # money_flow = (last_wavg_px * executed_qty)[:,1:]
+        # Inspired on https://www.investopedia.com/terms/m/mfi.asp
+        
+        money_flow = (executed_px * executed_qty)[:,1:]
 
-        # money_flow_pos = money_flow * np.diff(last_wavg_px) > 0
-        # money_flow_neg = money_flow * np.diff(last_wavg_px) < 0
+        money_flow_pos = torch.Tensor(money_flow * (np.diff(executed_px) > 0)).cuda()
+        money_flow_neg = torch.Tensor(money_flow * (np.diff(executed_px) < 0)).cuda()
 
-        # money_flow_pos_windows = torch.Tensor(money_flow_pos).unfold(1,kernel_size,1)
-        # money_flow_neg_windows = torch.Tensor(money_flow_neg).unfold(1,kernel_size,1)
+        # unfold generates a view, to save GPU memory it's better to move to cuda the original tensor before unfolding 
+        money_flow_pos_windows = money_flow_pos.unfold(1,kernel_size,1)
+        money_flow_neg_windows = money_flow_neg.unfold(1,kernel_size,1)
 
-        # money_flow_pos_sums = torch.nansum(money_flow_pos_windows, axis=2)
-        # money_flow_neg_sums = torch.nansum(money_flow_neg_windows, axis=2)
+        money_flow_pos_sums = torch.nansum(money_flow_pos_windows, axis=2)
+        money_flow_neg_sums = torch.nansum(money_flow_neg_windows, axis=2)
 
-        # #https://www.investopedia.com/terms/m/mfi.asp
-        # MFI = money_flow_pos_sums / (money_flow_pos_sums + money_flow_neg_sums)
-        # MFI = torch.Tensor(np.nan_to_num(MFI,nan=0.5))
-        # MFI = nn.AvgPool1d(kernel_size=kernel_size, stride=stride)(MFI.unsqueeze(0)).squeeze()
+        MFI = money_flow_pos_sums / (money_flow_pos_sums + money_flow_neg_sums)
+        MFI = reduce(torch.nan_to_num(MFI,nan=0.5).cpu().numpy(), 'MFI    ')
+
+        #TODO: rengo que hacer /cpu()?
+        del money_flow_pos
+        del money_flow_neg
+        del money_flow_pos_windows
+        del money_flow_neg_windows
+        del money_flow_pos_sums
+        del money_flow_neg_sums
+
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
-        # money_flows_windows = torch.Tensor(money_flow).unfold(1,kernel_size,1)
-        # executed_qty_windows = torch.Tensor(executed_qty[:,1:]).unfold(1,kernel_size,1)
+        # Inspired on https://www.investopedia.com/terms/v/vwap.asp
 
-        # #https://www.investopedia.com/terms/v/vwap.asp
-        # VWAP = torch.sum(money_flows_windows, axis=2) / torch.sum(executed_qty_windows, axis=2)
+        money_flows_windows = torch.Tensor(money_flow).cuda().unfold(1,kernel_size,1)
+        executed_qty_windows = torch.Tensor(executed_qty[:,1:]).cuda().unfold(1,kernel_size,1)
 
-        # ##################################################################
+        VWAP = torch.sum(money_flows_windows, axis=2) / torch.sum(executed_qty_windows, axis=2)
+        VWAP = pd.DataFrame(VWAP.cpu().numpy()).ffill(axis=1).values
+        VWAP = np.nan_to_num(VWAP) + np.isnan(VWAP) * np.nan_to_num(WAP[:,:VWAP.shape[1]])  # beginning of series
+        VWAP = reduce(VWAP, 'VWAP    ')
 
-        # WAP_windows = torch.Tensor(WAP).unfold(1,kernel_size,1)
+        del money_flows_windows
+        del executed_qty_windows
+        torch.cuda.empty_cache()
 
-        # moving_mean = torch.mean(WAP_windows, axis=2)
-        # moving_mean = nn.AvgPool1d(kernel_size=kernel_size, stride=stride)(moving_mean.unsqueeze(0)).squeeze()
 
-        # moving_median = torch.median(WAP_windows, axis=2)
+        ####
 
-        # moving_std  = torch.std(WAP_windows, axis=2)
-        # moving_std = nn.AvgPool1d(kernel_size=kernel_size, stride=stride)(moving_std.unsqueeze(0)).squeeze()
+        batch_size = 100000
+        num_batches = math.ceil(len(WAP) / batch_size)
 
-        # moving_min  = torch.min(WAP_windows, axis=2).values
-        # moving_max  = torch.max(WAP_windows, axis=2).values
+        moving_mean = []
+        moving_std = []
+        moving_min = []
+        moving_max = []
 
-        # #https://en.wikipedia.org/wiki/Ulcer_index
-        # R = torch.pow(100 * (torch.Tensor(WAP[:,-571:]) - moving_max) / moving_max, 2)
+        for bidx in range(num_batches):
 
-        # exec_pc = torch.Tensor(last_wavg_px[:,-571:])
-        # #https://www.investopedia.com/articles/trading/08/accumulation-distribution-line.asp
-        # CLV = ((exec_pc - moving_min) - (moving_max - exec_pc)) / (moving_max - moving_min)
+            start = int(bidx*batch_size)
+            end = int(bidx*batch_size) + min(batch_size, len(WAP) - start)
 
-        # windows_execlv = (torch.Tensor(executed_qty[:,-571:])*CLV).unfold(1,kernel_size,1)
-        # windows_vol = torch.Tensor(executed_qty[:,-571:]).unfold(1,kernel_size,1)
-        # #https://www.investopedia.com/terms/c/chaikinoscillator.asp
-        # #https://en.wikipedia.org/wiki/Chaikin_Analytics#Chaikin_Money_Flow
-        # CMF = torch.mean(windows_execlv, axis=2) / torch.mean(windows_vol, axis=2)
+            WAP_windows = torch.Tensor(WAP[start:end]).cuda().unfold(1,kernel_size,1)
 
-        # moving_min = nn.AvgPool1d(kernel_size=kernel_size, stride=stride)(moving_min.unsqueeze(0)).squeeze()
-        # moving_max = nn.AvgPool1d(kernel_size=kernel_size, stride=stride)(moving_max.unsqueeze(0)).squeeze()
-        # R = torch.sqrt(nn.AvgPool1d(kernel_size=kernel_size, stride=stride)(R.unsqueeze(0)).squeeze())
+            moving_mean.append(torch.mean(WAP_windows, axis=2).cpu())  # .copy()
+            moving_std.append(torch.std(WAP_windows, axis=2).cpu())
+            moving_min.append(torch.min(WAP_windows, axis=2).values.cpu())
+            moving_max.append(torch.max(WAP_windows, axis=2).values.cpu())
+
+            torch.cuda.empty_cache()
+
+
+        # Inspired on https://www.investopedia.com/terms/u/.....
+
+        moving_mean = torch.vstack(moving_mean).cuda()
+        moving_std = torch.vstack(moving_std).cuda()
+
+        WAP_cuda = torch.Tensor(WAP[:,-571:]).cuda()
+        bollinger_deviation = reduce(((moving_mean.cuda() - WAP_cuda) / (moving_std.cuda() + epsilon)).cpu().numpy())  #TODO moving_std==0 case
+
+        moving_mean = reduce(moving_mean.cpu().numpy())
+        moving_std = reduce(moving_std.cpu().numpy())
+
+        moving_min = torch.Tensor(np.vstack(moving_min)).cuda()
+        moving_max = torch.Tensor(np.vstack(moving_max)).cuda()
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+        # Inspired on https://www.investopedia.com/terms/u/ulcerindex.asp
+
+        R = reduce(torch.pow(100 * (WAP_cuda - moving_max) / moving_max, 2).cpu().numpy(), 'R       ')
+
+        del WAP_cuda
+        torch.cuda.empty_cache()
+
+
+        # Inspired on https://www.investopedia.com/articles/trading/08/accumulation-distribution-line.asp
+        lexpx = torch.Tensor(executed_px[:,-571:]).cuda()
+        CLV = torch.nan_to_num(((lexpx - moving_min) - (moving_max - lexpx)) / (moving_max - moving_min), nan=0., posinf=0, neginf=0)
+
+        del lexpx
+        torch.cuda.empty_cache()
+
+        moving_min = reduce(moving_min.cpu().numpy(), 'mov_min')
+        moving_max = reduce(moving_max.cpu().numpy(), 'mov_max')
+
+
+        # Inspired on https://www.investopedia.com/terms/c/chaikinoscillator.asp
+        lexqty = torch.Tensor(executed_qty[:,-571:]).cuda()
+        execlv_windows = (lexqty*CLV).unfold(1,kernel_size,1)
+        vol_windows = lexqty.unfold(1,kernel_size,1)
+        CMF = torch.nan_to_num(torch.mean(execlv_windows, axis=2) / torch.mean(vol_windows, axis=2), nan=0., posinf=0, neginf=0)
+
+        del lexqty
+        del execlv_windows
+        del vol_windows
+        torch.cuda.empty_cache()
+
+        CLV = reduce(CLV.cpu().numpy(), 'CLV    ')
+        CMF = reduce(CMF.cpu().numpy(), 'CMF    ')
+
+        #571
+
+
+
+        # ATR = moving_max / moving_min - 1
+
+        # middle_channel = (moving_max + moving_min) / 2
+        # donchian_deviation = (middle_channel - WAP) / (moving_max - moving_min + epsilon)  #TODO
 
         ################################################################################################
 
-        # print('processing series...')
-
-        WAP = squeeze(WAP)
-        last_wavg_px = squeeze(last_wavg_px)
-        log_returns = squeeze(log_returns)
-        executed_qty = squeeze(executed_qty)
+        WAP = reduce(WAP, 'WAP    ')
+        executed_px = reduce(executed_px, 'exe_px')
+        executed_qty = reduce(executed_qty, 'exe_qty')
 
         gc.collect()
 
@@ -236,20 +317,6 @@ class OptiverDataModule(pl.LightningDataModule):
 
         deep_log_returns = torch.diff(torch.log(deepWAP))
 
-        ############################# inspired on Technical Analysis #############################
-
-        # Volatility
-
-        # bollinger_deviation = (moving_mean - WAP) / (moving_std + epsilon)
-
-        # ATR = moving_max / moving_min - 1
-
-        # middle_channel = (moving_max + moving_min) / 2
-        # donchian_deviation = (middle_channel - WAP) / (moving_max - moving_min + epsilon)  #TODO
-
-        # Liquidity
-
-        # #TODO: normalizar volumenes absolutos
 
         ######################################## Trades ########################################
 
@@ -263,22 +330,26 @@ class OptiverDataModule(pl.LightningDataModule):
 
         # TODOS: derivadas (diff), visualizar para ver si se puede mejorar algo
 
-        nels = 95
+        nels = 91
 
         self.series = torch.stack((
-            WAP[:,-nels:],
+            moving_std[:,-nels:],
+            VWAP[:,-nels:],
+            MFI[:,-nels:],
             log_returns[:,-nels:],
             spread[:,-nels:],
-            # vol[:,-nels:],
-            # vol_unbalance1[:,-nels:],
-            # vol_unbalance2[:,-nels:],
-            # vol_unbalance3[:,-nels:],
-            # (WAP / deepWAP - 1)[:,-nels:],
-            # (WAP / mid_price - 1)[:,-nels:],
-            # (WAP / last_wavg_px - 1)[:,-nels:],
-            # (deepWAP / last_wavg_px - 1)[:,-nels:],
-            # ((log_returns + epsilon) / (deep_log_returns + epsilon) - 1)[:,-nels:],
-            # ((spread + epsilon) / (deep_spread + epsilon) - 1)[:,-nels:]
+            OFI1[:,-nels:],
+            OFI2[:,-nels:],
+            vol[:,-nels:],
+            vol_unbalance1[:,-nels:],
+            vol_unbalance2[:,-nels:],
+            vol_unbalance3[:,-nels:],
+            (WAP / deepWAP - 1)[:,-nels:],
+            (WAP / mid_price - 1)[:,-nels:],
+            (WAP / executed_px - 1)[:,-nels:],
+            (deepWAP / executed_px - 1)[:,-nels:],
+            ((log_returns + epsilon) / (deep_log_returns + epsilon) - 1)[:,-nels:],
+            ((spread + epsilon) / (deep_spread + epsilon) - 1)[:,-nels:]
         ), axis=1)
 
         ###############################################################################
@@ -313,6 +384,10 @@ class OptiverDataModule(pl.LightningDataModule):
 
         #     scaler = MinMaxScaler().fit(s[:,i].T)
         #     s[:,i] = scaler.transform(s[:,i].T).T
+
+        self.series = self.series.cpu()
+        self.series = (self.series - torch.mean(self.series, dim=(0,2)).unsqueeze(1)) / torch.std(self.series, dim=(0,2)).unsqueeze(1)
+        self.series = self.series.cuda()
 
         # self.series = s
 
