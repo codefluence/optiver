@@ -15,7 +15,7 @@ from utils import blend, smooth_bce, utility_score
 
 class PatternFinder(LightningModule):
 
-    def __init__(self, in_channels=4, multf=2):
+    def __init__(self, in_channels=4, multf=8):
 
         super(PatternFinder, self).__init__()
 
@@ -32,11 +32,11 @@ class PatternFinder(LightningModule):
         # self.avgpool_b = nn.AvgPool1d(kernel_size=15, stride=3)
         # self.avgpool_c = nn.AvgPool1d(kernel_size=5, stride=1)
         
-        self.conv1_a = nn.Conv1d(in_channels, in_channels*multf, kernel_size=3, stride=3, padding=0, bias=True)
-        self.conv2_a = nn.Conv1d(in_channels*multf, in_channels*multf*2, kernel_size=3, stride=3, padding=0, bias=True)
-        self.conv3_a = nn.Conv1d(in_channels*multf*2, in_channels*multf*2*2, kernel_size=3, stride=3, padding=0, bias=True)
+        self.conv1_a = nn.Conv1d(in_channels, in_channels*multf, kernel_size=4, stride=4, padding=0, bias=True)
+        self.conv2_a = nn.Conv1d(in_channels*multf, in_channels*multf*2, kernel_size=4, stride=4, padding=0, bias=True)
+        self.conv3_a = nn.Conv1d(in_channels*multf*2, in_channels*multf*2*2, kernel_size=4, stride=4, padding=0, bias=True)
 
-        self.conv1_b = nn.Conv1d(in_channels, in_channels*multf, kernel_size=2, stride=2, padding=0, bias=True)
+        self.conv1_b = nn.Conv1d(in_channels, in_channels*multf, kernel_size=3, stride=3, padding=0, bias=True)
         self.conv2_b = nn.Conv1d(in_channels*multf, in_channels*multf*2, kernel_size=3, stride=3, padding=0, bias=True)
         self.conv3_b = nn.Conv1d(in_channels*multf*2, in_channels*multf*2*2, kernel_size=3, stride=3, padding=0, bias=True)
 
@@ -44,7 +44,7 @@ class PatternFinder(LightningModule):
         self.conv2_c = nn.Conv1d(in_channels*multf, in_channels*multf*2, kernel_size=2, stride=2, padding=0, bias=True)
         self.conv3_c = nn.Conv1d(in_channels*multf*2, in_channels*multf*2*2, kernel_size=2, stride=2, padding=0, bias=True)
 
-        self.linear = nn.Linear(in_channels*multf*2*2*3,1)  #in_channels*multf*2*2
+        self.linear = nn.Linear(in_channels*multf*2*2 * 1 * 3,1)  #in_channels*multf*2*2
 
         self.loss = nn.MSELoss()
 
@@ -52,9 +52,9 @@ class PatternFinder(LightningModule):
 
         x = self.batchnorm(series)
     
-        x_a = x
-        x_b = x[:,:,-60:]
-        x_c = x[:,:,-30:]
+        x_a = x[:,:,-64:]
+        x_b = x[:,:,-27:]
+        x_c = x[:,:,-8:]
 
         x_a = self.conv1_a(x_a)
         x_a = F.leaky_relu(x_a)
@@ -77,13 +77,12 @@ class PatternFinder(LightningModule):
         x_c = self.conv3_c(x_c)
         x_c = F.leaky_relu(x_c)
 
-        x_a = x_a[:,:,1] - x_a[:,:,0]
-        x_b = x_b[:,:,1] - x_b[:,:,0]
-        x_c = x_c[:,:,1] - x_c[:,:,0]
+        # x_a = x_a[:,:,1] - x_a[:,:,0]
+        # x_c = x_c[:,:,1] - x_c[:,:,0]
 
-        # x_a = torch.flatten(x_a, start_dim=1, end_dim=2)
-        # x_b = torch.flatten(x_b, start_dim=1, end_dim=2)
-        # x_c = torch.flatten(x_c, start_dim=1, end_dim=2)
+        x_a = torch.flatten(x_a, start_dim=1, end_dim=2)
+        x_b = torch.flatten(x_b, start_dim=1, end_dim=2)
+        x_c = torch.flatten(x_c, start_dim=1, end_dim=2)
 
         x = torch.hstack((x_a, x_b, x_c))
 
@@ -91,11 +90,11 @@ class PatternFinder(LightningModule):
 
     def training_step(self, train_batch, batch_idx):
 
-        series, _, volatility = train_batch
+        series, _, targets = train_batch
 
         logits = self.forward(series)[0]  #, stats.reshape(-1,1)
 
-        loss = self.loss(logits.squeeze(), volatility)
+        loss = torch.sqrt(torch.mean(torch.square((targets - logits.squeeze()) / targets), dim=0))
 
         self.log('train_loss', loss)
 
@@ -103,24 +102,20 @@ class PatternFinder(LightningModule):
 
     def validation_step(self, val_batch, batch_idx):
 
-        series, _, volatility = val_batch
+        series, _, targets = val_batch
 
         logits = self.forward(series)[0]  #,stats.reshape(-1,1)
 
-        loss = self.loss(logits.squeeze(), volatility)
-
-        v = volatility.cpu().numpy()
-        p = logits.squeeze().cpu().numpy()
-        rmspe = np.sqrt(np.mean(np.square((v - p) / v), axis=0))
+        loss = torch.sqrt(torch.mean(torch.square((targets - logits.squeeze()) / targets), dim=0))
 
         self.log('val_loss', loss)
-        self.log('val_rmspe', rmspe)
+        self.log('val_rmspe', loss.cpu().item())
 
 
     def configure_optimizers(self):
 
-        optimizer = torch.optim.Adam(self.parameters(), lr=3e-4)
-        sccheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=2, factor=1/5, verbose=True, min_lr=1e-5)
+        optimizer = torch.optim.Adam(self.parameters(), lr=3e-3)
+        sccheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=2, factor=1/3, verbose=True, min_lr=1e-5)
         return [optimizer], {'scheduler': sccheduler, 'monitor': 'val_rmspe'}
 
 
@@ -153,17 +148,17 @@ class VolatilityClassifier(LightningModule):
         x = self.batch_norm1(x)
         x = self.dense1(x)
         x = F.leaky_relu(x)
-        x = F.dropout(x, p=0.1)
+        x = F.dropout(x, p=0.2)
 
         x = self.batch_norm2(x)
         x = self.dense2(x)
         x = F.leaky_relu(x)
-        x = F.dropout(x, p=0.1)
+        x = F.dropout(x, p=0.2)
 
         x = self.batch_norm3(x)
         x = self.dense3(x)
         x = F.leaky_relu(x)
-        x = F.dropout(x, p=0.1)
+        x = F.dropout(x, p=0.2)
 
         return self.linear(x)
 
@@ -173,7 +168,7 @@ class VolatilityClassifier(LightningModule):
 
         preds = self.forward(stats)
 
-        loss = self.loss(preds.squeeze(), targets)
+        loss = torch.sqrt(torch.mean(torch.square((targets - preds.squeeze()) / targets), dim=0))
 
         self.log('train_loss', loss)
 
@@ -181,24 +176,20 @@ class VolatilityClassifier(LightningModule):
 
     def validation_step(self, val_batch, batch_idx):
 
-        _, stats, volatility = val_batch
+        _, stats, targets = val_batch
 
         preds = self.forward(stats)
 
-        loss = self.loss(preds.squeeze(), volatility)
-
-        v = volatility.cpu().numpy()
-        p = preds.squeeze().cpu().numpy()
-        rmspe = np.sqrt(np.mean(np.square((v - p) / v), axis=0))
+        loss = torch.sqrt(torch.mean(torch.square((targets - preds.squeeze()) / targets), dim=0))
 
         self.log('val_loss', loss)
-        self.log('val_rmspe', rmspe)
+        self.log('val_rmspe', loss.cpu().item())
 
 
     def configure_optimizers(self):
 
         optimizer = torch.optim.Adam(self.parameters(), lr=3e-3)
-        sccheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=2, factor=1/5, verbose=True, min_lr=1e-5)
+        sccheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=2, factor=1/3, verbose=True, min_lr=1e-5)
         return [optimizer], {'scheduler': sccheduler, 'monitor': 'val_rmspe'}
 
 

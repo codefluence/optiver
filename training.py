@@ -15,8 +15,8 @@ def fit_model():
 
     data = OptiverDataModule()
 
-    model = PatternFinder(data.series.shape[1])
-    # model = VolatilityClassifier(data.stats.shape[1])
+    # model = PatternFinder(data.series.shape[1])
+    model = VolatilityClassifier(data.stats.shape[1])
 
     filename = 'optiver-{epoch}-{val_rmspe:.4f}'
     dirpath='./weights/'
