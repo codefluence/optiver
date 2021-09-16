@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from sklearn.preprocessing import MinMaxScaler
 
 np.set_printoptions(threshold=2000, linewidth=140, precision=3, edgeitems=20, suppress=1)
-pd.set_option('display.max_rows', 601)
+pd.set_option('display.max_rows', 600)
 
 
 
@@ -31,7 +31,7 @@ class OptiverDataModule(pl.LightningDataModule):
         with open('./settings.json') as f:
             self.settings = json.load(f)
 
-        kernel_size = 6
+        kernel_size = 10
         stride = 6
         epsilon = 1e-6
 
@@ -45,13 +45,8 @@ class OptiverDataModule(pl.LightningDataModule):
         print('loading cached data...')
         tensors = np.load(self.settings['ROOT_DATA'] + 'cache/optiver_series.npz')
 
-        self.targets = tensors['targets']
-
-        self.targets = np.hstack((self.targets, np.zeros((len(self.targets), 3)).astype(np.float32)))
-        self.targets[:,-1] = self.targets[:,3]
-        self.targets[:,3:6] = np.nan
-
-        series = tensors['series']  # shape(428932, 11, 600)
+        targets = tensors['targets']
+        series  = tensors['series']  # shape(428932, 11, 600)
 
         #TODO: recrear tensores file:
         series[:,9] = np.nan_to_num(series[:,9])
@@ -61,7 +56,7 @@ class OptiverDataModule(pl.LightningDataModule):
 
         print('processing series...')
 
-        sumexecs = self.targets[:,:2].copy()
+        sumexecs = targets[:,:2].copy()
         sumexecs[:,1] = np.sum(series[:,9], axis=1)
 
         sumexecs_means = sumexecs.copy()
@@ -144,8 +139,6 @@ class OptiverDataModule(pl.LightningDataModule):
             OLI1 = get_liquidityflow(bid_px1, bid_qty1 / stock_means, True) + get_liquidityflow(ask_px1, ask_qty1 / stock_means, False)
             OLI2 = get_liquidityflow(bid_px2, bid_qty2 / stock_means, True) + get_liquidityflow(ask_px2, ask_qty2 / stock_means, False)
 
-            self.targets[start:end,5] = (torch.mean(OLI1[:,-300:], dim=1) + torch.mean(OLI2[:,-300:], dim=1)).cpu().numpy()
-
             OLI1 = reduce(OLI1)
             OLI2 = reduce(OLI2)
 
@@ -190,8 +183,6 @@ class OptiverDataModule(pl.LightningDataModule):
             executed_px = torch.nan_to_num(executed_px) + torch.isnan(executed_px) * torch.nan_to_num(WAP)
 
             log_returns = torch.diff(torch.log(WAP))
-            self.targets[start:end,4] = torch.sqrt(torch.sum(torch.pow(log_returns[:,-300:],2),dim=1)).cpu().numpy()
-            self.targets[start:end,3] = torch.sqrt(torch.sum(torch.pow(log_returns,2),dim=1)).cpu().numpy()
             
             log_returns_windows = log_returns.unfold(1,kernel_size,1)
             realized_vol = reduce(torch.sqrt(torch.sum(torch.pow(log_returns_windows,2),dim=2))) #TODO
@@ -217,7 +208,7 @@ class OptiverDataModule(pl.LightningDataModule):
             OBV = reduce(((executed_qty[:,1:] * (torch.diff(executed_px) > 0)) - (executed_qty[:,1:] * (torch.diff(executed_px) < 0))) / stock_means)
 
             # Inspired on https://www.investopedia.com/terms/f/force-index.asp
-            force_index = reduce(torch.diff(torch.log(executed_px)) * executed_qty[:,1:] * 1e5 / stock_means)
+            # force_index = reduce(torch.diff(torch.log(executed_px)) * executed_qty[:,1:] * 1e5 / stock_means)
 
             # TODO: ??????????
             # executed_qty_windows = executed_qty.unfold(1,kernel_size,1)
@@ -262,7 +253,6 @@ class OptiverDataModule(pl.LightningDataModule):
             VWAP = torch.nan_to_num(VWAP) + torch.isnan(VWAP) * torch.nan_to_num(WAP[:,:VWAP.shape[1]])  # beginning of series
             VWAP_returns = reduce(torch.diff(torch.log(VWAP)))
 
-            del VWAP
             del money_flows_windows
             del executed_qty_windows
             torch.cuda.empty_cache()
@@ -287,6 +277,15 @@ class OptiverDataModule(pl.LightningDataModule):
 
             del moving_mean
             moving_std = reduce(moving_std)
+
+
+            ####
+
+            VWAP_windows = VWAP.unfold(1,kernel_size,1)
+            moving_std_VWAP = reduce(torch.std(VWAP_windows, axis=2))
+            del VWAP
+            del VWAP_windows
+            torch.cuda.empty_cache()
 
 
             # Inspired on https://www.investopedia.com/terms/u/ulcerindex.asp
@@ -324,7 +323,7 @@ class OptiverDataModule(pl.LightningDataModule):
             CLV = reduce(CLV)
             CMF = reduce(CMF)
 
-            executed_px_returns = reduce(torch.diff(torch.log(executed_px)))
+            # executed_px_returns = reduce(torch.diff(torch.log(executed_px)))
 
             del executed_px
             del WAP
@@ -349,7 +348,7 @@ class OptiverDataModule(pl.LightningDataModule):
                         spread.shape[1],
 
                         deepWAP_returns.shape[1],
-                        executed_px_returns.shape[1],
+                        # executed_px_returns.shape[1],
                         mid_price_returns.shape[1],
                         VWAP_returns.shape[1],
 
@@ -359,7 +358,7 @@ class OptiverDataModule(pl.LightningDataModule):
                         vol_unbalance3.shape[1],
 
                         OBV.shape[1],
-                        force_index.shape[1],
+                        #force_index.shape[1],
                         MFI.shape[1],
                         bollinger_deviation.shape[1],
                         R.shape[1],
@@ -374,32 +373,35 @@ class OptiverDataModule(pl.LightningDataModule):
 
             processed.append(np.stack((
 
-                OLI1[:,-nels:],    # 0.47
-                OLI2[:,-nels:],
+                # Volume / liquidity (0.45)
+                # OLI1[:,-nels:],    
+                # OLI2[:,-nels:],
+                # vol_total_diff[:,-nels:],
+                # vol_unbalance1[:,-nels:],
+                # vol_unbalance2[:,-nels:],
+                # vol_unbalance3[:,-nels:],
 
-                vol_total_diff[:,-nels:],    # 0.47
-                vol_unbalance1[:,-nels:],
-                vol_unbalance2[:,-nels:],
-                vol_unbalance3[:,-nels:],
-
-                # moving_std[:,-nels:],    # 0.31 <----------------------
-                # realized_vol[:,-nels:],    # 0.31 <----------------------
-
-                # spread[:,-nels:],    # 0.42 <----------------------
-
-                # log_returns[:,-nels:],    # 0.286 <----------------------
-                # # 0.27 sin log_returns, 0.26 con
+                # Returns (0.26)
+                log_returns[:,-nels:],    # 0.286 <----------------------
                 # deepWAP_returns[:,-nels:],    
                 # executed_px_returns[:,-nels:],    # 0.48
                 # mid_price_returns[:,-nels:],    # 0.46
-                # VWAP_returns[:,-nels:],    # 0.38 <----------------------
+                VWAP_returns[:,-nels:],    # 0.38 <----------------------
+
+                # Volatility (0.27)
+                moving_std[:,-nels:],    # 0.29 <----------------------
+                moving_std_VWAP[:,-nels:],
+                # realized_vol[:,-nels:],    # 0.31 <----------------------
+
+                # Spreads (0.26)
+                spread[:,-nels:],    # 0.4 <----------------------
+                ATR[:,-nels:],   # 0.29 <----------------------
+                # R[:,-nels:],   # 0.38 <----------------------
 
                 # OBV[:,-nels:],   # 0.54
                 # force_index[:,-nels:],   # 0.51
                 # MFI[:,-nels:],   # 0.53
                 # bollinger_deviation[:,-nels:],   # 0.53
-                # R[:,-nels:],   # 0.38 <----------------------
-                # ATR[:,-nels:],   # 0.33 <----------------------
                 # donchian_deviation[:,-nels:],   # 0.53
                 # CLV[:,-nels:],   # 0.53
                 # CMF[:,-nels:],   # 0.53
@@ -417,13 +419,13 @@ class OptiverDataModule(pl.LightningDataModule):
 
         ###############################################################################
 
-        # print('computing stats...')
+        print('computing stats...')
 
-        # l = series.shape[-1]
+        l = series.shape[-1]
 
-        # all_means = np.mean(series,axis=2)
-        # hal_means = np.mean(series[:,:,-l//2:],axis=2)
-        # qua_means = np.mean(series[:,:,-l//4:],axis=2)
+        all_means = np.mean(series,axis=2)
+        hal_means = np.mean(series[:,:,-l//2:],axis=2)
+        qua_means = np.mean(series[:,:,-l//4:],axis=2)
 
         # series_diff = np.diff(series, axis=2)
 
@@ -443,16 +445,16 @@ class OptiverDataModule(pl.LightningDataModule):
         # hal_abmax = np.max(np.abs(series[:,:,-l//2:]),axis=2)
         # qua_abmax = np.max(np.abs(series[:,:,-l//4:]),axis=2)
 
-        # stats = np.hstack((
-        #                         all_means, hal_means, qua_means,
-        #                         #all_means_diff, hal_means_diff, qua_means_diff,
-        #                         #all_std, hal_std, qua_std,
-        #                         #all_std_diff, hal_std_diff, qua_std_diff,
-        #                         #all_abmax, hal_abmax, qua_abmax
-        #                     ))
+        stats = np.hstack((
+                                all_means, hal_means, qua_means,
+                                #all_means_diff, hal_means_diff, qua_means_diff,
+                                #all_std, hal_std, qua_std,
+                                #all_std_diff, hal_std_diff, qua_std_diff,
+                                #all_abmax, hal_abmax, qua_abmax
+                            ))
 
-        # scaler = StandardScaler().fit(stats[self.targets[:,0] % 5 != 0])
-        # self.stats = scaler.transform(stats)
+        scaler = StandardScaler().fit(stats[targets[:,0] % 5 != 0])
+        self.stats = scaler.transform(stats)
 
         #TODO: correlations
 
@@ -461,27 +463,19 @@ class OptiverDataModule(pl.LightningDataModule):
         #     scaler = MinMaxScaler().fit(s[:,i].T)
         #     s[:,i] = scaler.transform(s[:,i].T).T
 
-    def set_up_for_training(self, mode):
+        self.targets = targets
 
-        targs_train = self.targets[self.targets[:,0] % 5 != 0]
-        self.targets_train = targs_train[:,mode]
-        self.index_train = targs_train[:,-1]
-
-        targs_val = self.targets[self.targets[:,0] % 5 == 0]
-        self.targets_val = targs_val[:,mode]
-        self.index_val = targs_val[:,-1]
-
-        if mode == 5:
-
-            self.feats = self.series[:,:6,:-50]
+        #TODO
+        #optim
+        #augmentation
 
     def train_dataloader(self):
 
-        return DataLoader(SeriesDataSet(self.feats, self.targets_train, self.index_train), batch_size=512, shuffle=True)
+        return DataLoader(SeriesDataSet(self.series, self.stats, self.targets[self.targets[:,0] % 5 != 0]), batch_size=512, shuffle=True)
 
     def val_dataloader(self):
 
-        return DataLoader(SeriesDataSet(self.feats, self.targets_val, self.index_val), batch_size=1024, shuffle=False)
+        return DataLoader(SeriesDataSet(self.series, self.stats, self.targets[self.targets[:,0] % 5 == 0]), batch_size=1024, shuffle=False)
 
     def get_time_series(self):
 
@@ -546,13 +540,13 @@ class OptiverDataModule(pl.LightningDataModule):
 
 class SeriesDataSet(Dataset):
     
-    def __init__(self, feats, targets, index):
+    def __init__(self, series, stats, targets):
 
         super(SeriesDataSet, self).__init__()
 
-        self.feats = feats
+        self.series = series
+        self.stats = stats
         self.targets = targets
-        self.index = index
 
     def __len__(self):
 
@@ -560,8 +554,9 @@ class SeriesDataSet(Dataset):
 
     def __getitem__(self, idx):
 
-        return self.feats[int(self.index[idx])], self.targets[idx]
+        series_index = int(self.targets[idx,-1])
 
+        return self.series[series_index], self.stats[series_index], self.targets[idx,-2]
 
 
 if __name__ == '__main__':
