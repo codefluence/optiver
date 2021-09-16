@@ -9,22 +9,24 @@ from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pytorch_lightning.callbacks import ModelCheckpoint
 
 from data import OptiverDataModule
-from model import VolatilityClassifier, PatternFinder
+from model import VolatilityClassifier, PatternFinder, LiquidityTrend
 
 def fit_model():
 
     data = OptiverDataModule()
+    data.set_up_for_training(5)
 
-    # model = PatternFinder(data.series.shape[1])
-    model = VolatilityClassifier(data.stats.shape[1])
+    # model = PatternFinder(data.feats.shape[1])
+    # model = VolatilityClassifier(data.feats.shape[1])
+    model = LiquidityTrend(data.feats.shape[1])
 
-    filename = 'optiver-{epoch}-{val_rmspe:.4f}'
+    filename = 'optiver-{epoch}-{val_monit:.4f}'
     dirpath='./weights/'
 
     print('time start:',datetime.now().strftime("%H:%M:%S"))
 
     early_stop_callback = EarlyStopping(
-        monitor='val_rmspe',
+        monitor='val_monit',
         patience=7,
         verbose=True,
         mode='min'
@@ -35,7 +37,7 @@ def fit_model():
         filename=filename,
         save_top_k=1,
         verbose=True,
-        monitor='val_rmspe',
+        monitor='val_monit',
         mode='min'
     )
 
