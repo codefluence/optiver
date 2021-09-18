@@ -1,7 +1,9 @@
+import math
 from datetime import datetime
 
 import torch
 import numpy as np
+import pandas as pd
 
 import pytorch_lightning as pl
 from pytorch_lightning import loggers as pl_loggers
@@ -11,21 +13,36 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 from data import OptiverDataModule
 from model import VolatilityClassifier, PatternFinder
 
+from net1d import Net1D
+from resnet1d import ResNet1D
+
 def fit_model():
 
     data = OptiverDataModule()
 
-    model = PatternFinder(data.series.shape[1])
-    # model = VolatilityClassifier(data.series.shape[1])
+    model = PatternFinder(in_channels=data.series.shape[1])
+    #model = VolatilityClassifier(data.stats.shape[1])
+
+    # model = ResNet1D(
+    #                     in_channels=15, 
+    #                     base_filters=15, 
+    #                     kernel_size=3, 
+    #                     stride=2, 
+    #                     n_block=4, 
+    #                     groups=3,
+    #                     n_classes=1, 
+    #                     downsample_gap=max(3//8, 1), 
+    #                     increasefilter_gap=max(3//4, 1), 
+    #                     verbose=False)
 
     filename = 'optiver-{epoch}-{val_monit:.4f}'
-    dirpath='./weights/'
+    dirpath='./checkpoints/'
 
     print('time start:',datetime.now().strftime("%H:%M:%S"))
 
     early_stop_callback = EarlyStopping(
         monitor='val_monit',
-        patience=7,
+        patience=12,
         verbose=True,
         mode='min'
     )
@@ -53,7 +70,42 @@ def fit_model():
     print('time end:',datetime.now().strftime("%H:%M:%S"))
 
 
+def eval_model(checkpoint_name='optiver-cnn', device='cuda'):
+
+    data = OptiverDataModule()
+
+    model = PatternFinder.load_from_checkpoint('./checkpoints/{}.ckpt'.format(checkpoint_name), in_channels=data.series.shape[1])
+
+    model.cuda()
+    model.eval()
+
+    output = np.zeros(len(data.series))
+    output[:] = np.nan
+
+    batch_size = 2**14
+    num_batches = math.ceil(len(data.series) / batch_size)
+
+    for bidx in range(num_batches):
+
+        start = bidx*batch_size
+        end   = start + min(batch_size, len(data.series) - start)
+        print(start,end)
+
+        if start == end:
+            break
+
+        output[start:end]= model(torch.tensor(data.series[start:end], dtype=torch.float32, device=device))[0].detach().cpu().numpy().squeeze()
+
+    targets = torch.tensor(data.targets[:,-1], dtype=torch.float32).cuda()
+    predictions = torch.tensor(output, dtype=torch.float32).cuda()
+    evaluation = torch.sqrt(torch.mean(torch.square((targets - predictions) / targets), dim=0))
+    print(evaluation)
+
+    row_ids = pd.Series(data.targets[:,0].astype('int').astype('str')) + '-' + pd.Series(data.targets[:,1].astype('int').astype('str'))
+    submission = pd.DataFrame({ 'row_id': row_ids, 'target': predictions.detach().cpu().numpy() })
+    #submission.to_csv('submission.csv', index=False)
+
 if __name__ == '__main__':
 
-    fit_model()
+    eval_model()
 
