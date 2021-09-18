@@ -2,6 +2,8 @@ import os
 import gc
 import json
 import math
+import pickle
+import platform
 from tqdm import tqdm
 
 from sklearn.preprocessing import StandardScaler
@@ -13,72 +15,83 @@ import torch
 import torch.nn as nn
 
 import pytorch_lightning as pl
-from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+from torch.utils.data import DataLoader, Dataset
 
 from sklearn.preprocessing import MinMaxScaler
 
-np.set_printoptions(threshold=2000, linewidth=140, precision=3, edgeitems=20, suppress=1)
+np.set_printoptions(threshold=2000, linewidth=140, precision=4, edgeitems=20, suppress=1)
 pd.set_option('display.max_rows', 600)
 
 
 
 class OptiverDataModule(pl.LightningDataModule):
 
-    def __init__(self):
+    def __init__(self, settings_path='./settings.json', device='cuda', nels=64,
+                 batch_size=50000, kernel_size=7, stride=5, CV_split=0):
 
         super(OptiverDataModule, self).__init__()
 
-        with open('./settings.json') as f:
-            self.settings = json.load(f)
+        self.CV_split = CV_split
 
-        kernel_size = 10
-        stride = 6
         epsilon = 1e-6
 
-        if not os.path.exists(self.settings['ROOT_DATA'] +'cache/optiver_series.npz'):
+        with open(settings_path) as f:
+            
+            settings = json.load(f)
 
-            print('creating cached data...')
-            series, targets = self.get_time_series()
+        if settings['ENV'] == 'train':
 
-            np.savez_compressed(self.settings['ROOT_DATA'] + 'cache/optiver_series.npz', series=series, targets=targets)
+            if not os.path.exists(settings['DATA_DIR'] +'optiver_series.npz'):
 
-        print('loading cached data...')
-        tensors = np.load(self.settings['ROOT_DATA'] + 'cache/optiver_series.npz')
+                print('creating tensors file...')
+                series, targets = get_time_series(settings)
 
-        targets = tensors['targets']
-        series  = tensors['series']  # shape(428932, 11, 600)
+                np.savez_compressed(settings['DATA_DIR'] + 'optiver_series.npz', series=series, targets=targets)
 
-        #TODO: recrear tensores file:
-        series[:,9] = np.nan_to_num(series[:,9])
-        series[:,10] = np.nan_to_num(series[:,10])
+            print('reading tensors file...')
+            tensors = np.load(settings['DATA_DIR'] + 'optiver_series.npz')
 
+            targets = tensors['targets']
+            series  = tensors['series']  # shape(428932, 11, 600)
+        else:
+
+            print('creating tensors...')
+            series, targets = get_time_series(settings)
+
+        ##############################################
+        series[:,-2:] = np.nan_to_num(series[:,-2:])
+        series[:,8][series[:,8]==0] = 1
+        ##############################################
+
+        assert((~ np.isfinite(series[:,:8])).sum() == 0)
+        assert((~ np.isfinite(series[:,-2:])).sum() == 0)
+
+
+
+        print('processing exec qty stats...')
+
+        # total exec qty (time span)
+        stats = np.empty((len(series),2), dtype=np.float32)
+        stats[:,0] = np.sum(series[:,9], axis=1)
+
+        for i in np.unique(targets[:,0]):
+            idx = targets[:,0] == int(i)
+            stats[idx,1] = np.mean(stats[idx,0])
 
 
         print('processing series...')
 
-        sumexecs = targets[:,:2].copy()
-        sumexecs[:,1] = np.sum(series[:,9], axis=1)
-
-        sumexecs_means = sumexecs.copy()
-
-        for i in np.unique(sumexecs[:,0]):
-            idx = sumexecs[:,0] == int(i)
-            sumexecs_means[idx,1] = np.mean(sumexecs[idx][:,1])
-
-        sumexecs_means = sumexecs_means[:,1:2]
-        del sumexecs
-
         def reduce(array):
 
-            a = nn.AvgPool1d(kernel_size=kernel_size, stride=stride)(array.unsqueeze(0)).squeeze().cpu().numpy()
+            #TODO: con una sola linea peta
+            a = nn.AvgPool1d(kernel_size=kernel_size, stride=stride)(array.unsqueeze(0)).squeeze(0).cpu().numpy()
 
             copy = a.copy()
 
             del a
             torch.cuda.empty_cache()
 
-            assert(np.isnan(copy).sum() == 0)
-            assert(np.isinf(copy).sum() == 0)
+            assert((~ np.isfinite(copy)).sum() == 0)
 
             return copy
 
@@ -87,8 +100,8 @@ class OptiverDataModule(pl.LightningDataModule):
 
             torch.cuda.empty_cache()
 
-            price_diff = torch.diff(prices)
-            vol_diff   = torch.diff(qties)
+            price_diff = torch_diff(prices)
+            vol_diff   = torch_diff(qties)
 
             if isbuy:
 
@@ -102,20 +115,14 @@ class OptiverDataModule(pl.LightningDataModule):
                         (price_diff > 0)  * torch.roll(qties, 1, 1)[:,1:] + \
                         (price_diff < 0)  * qties[:,1:]
 
-
-
-
-        device = 'cuda'
-
         processed = []
 
-        batch_size = 50000
         num_batches = math.ceil(len(series) / batch_size)
 
         for bidx in range(num_batches):
 
-            start = int(bidx*batch_size)
-            end = int(bidx*batch_size) + min(batch_size, len(series) - start)
+            start = bidx*batch_size
+            end   = start + min(batch_size, len(series) - start)
 
             bid_px1 = torch.tensor(series[start:end,0], device=device)
             ask_px1 = torch.tensor(series[start:end,1], device=device)
@@ -134,26 +141,23 @@ class OptiverDataModule(pl.LightningDataModule):
             # executed_qty_dist =  reduce(np.divide(executed_qty, sumexecs))
             # executed_count_dist = reduce(np.divide(executed_count, np.expand_dims(np.sum(executed_count,axis=1),axis=1)))
 
-            stock_means = torch.tensor(sumexecs_means[start:end], device=device)
+            texecqty_mean = torch.tensor(stats[:,1][start:end], device=device).unsqueeze(1)
 
-            OLI1 = get_liquidityflow(bid_px1, bid_qty1 / stock_means, True) + get_liquidityflow(ask_px1, ask_qty1 / stock_means, False)
-            OLI2 = get_liquidityflow(bid_px2, bid_qty2 / stock_means, True) + get_liquidityflow(ask_px2, ask_qty2 / stock_means, False)
+            OLI1 = get_liquidityflow(bid_px1, bid_qty1 / texecqty_mean, True) + get_liquidityflow(ask_px1, ask_qty1 / texecqty_mean, False)
+            OLI2 = get_liquidityflow(bid_px2, bid_qty2 / texecqty_mean, True) + get_liquidityflow(ask_px2, ask_qty2 / texecqty_mean, False)
 
             OLI1 = reduce(OLI1)
             OLI2 = reduce(OLI2)
-
-            # OFI1 = reduce(get_liquidityflow(bid_px1, bid_qty1 / stock_means, True) - get_liquidityflow(ask_px1, ask_qty1 / stock_means, False))
-            # OFI2 = reduce(get_liquidityflow(bid_px2, bid_qty2 / stock_means, True) - get_liquidityflow(ask_px2, ask_qty2 / stock_means, False))
 
             torch.cuda.empty_cache()
 
             t_bid_size = bid_qty1 + bid_qty2
             t_ask_size = ask_qty1 + ask_qty2
 
-            vol_total_diff = reduce(torch.diff(torch.log(t_bid_size + t_ask_size)))
-            vol_unbalance1 = reduce(torch.diff(t_ask_size / ( t_ask_size + t_bid_size + epsilon)))
-            vol_unbalance2 = reduce(torch.diff((ask_qty2 + bid_qty2 - ask_qty1 - bid_qty1) / (stock_means + epsilon)))
-            vol_unbalance3 = reduce(torch.diff((ask_qty1 + bid_qty2 - ask_qty2 - bid_qty1) / (stock_means + epsilon)))
+            vol_total_diff = reduce(torch_diff(torch.log(t_bid_size + t_ask_size)))
+            vol_unbalance1 = reduce(torch_diff(t_ask_size / ( t_ask_size + t_bid_size + epsilon)))
+            vol_unbalance2 = reduce(torch_diff((ask_qty2 + bid_qty2 - ask_qty1 - bid_qty1) / (texecqty_mean + epsilon)))
+            vol_unbalance3 = reduce(torch_diff((ask_qty1 + bid_qty2 - ask_qty2 - bid_qty1) / (texecqty_mean + epsilon)))
 
             w_avg_bid_price = (bid_px1*bid_qty1 + bid_px2*bid_qty2) / t_bid_size
             w_avg_ask_price = (ask_px1*ask_qty1 + ask_px2*ask_qty2) / t_ask_size
@@ -167,7 +171,7 @@ class OptiverDataModule(pl.LightningDataModule):
             WAP = (bid_px1*ask_qty1 + ask_px1*bid_qty1) / (bid_qty1 + ask_qty1)
 
             deepWAP = (w_avg_bid_price * t_ask_size + w_avg_ask_price * t_bid_size) / (t_bid_size + t_ask_size)
-            deepWAP_returns = reduce(torch.diff(torch.log(deepWAP)))
+            deepWAP_returns = reduce(torch_diff(torch.log(deepWAP)))
 
             del deepWAP
             del t_bid_size
@@ -180,16 +184,16 @@ class OptiverDataModule(pl.LightningDataModule):
             del w_avg_ask_price
             torch.cuda.empty_cache()
 
-            executed_px = torch.nan_to_num(executed_px) + torch.isnan(executed_px) * torch.nan_to_num(WAP)
+            executed_px = torch_nan_to_num(executed_px) + torch.isnan(executed_px) * torch_nan_to_num(WAP)
 
-            log_returns = torch.diff(torch.log(WAP))
+            log_returns = torch_diff(torch.log(WAP))
             
             log_returns_windows = log_returns.unfold(1,kernel_size,1)
             realized_vol = reduce(torch.sqrt(torch.sum(torch.pow(log_returns_windows,2),dim=2))) #TODO
 
             log_returns = reduce(log_returns)
 
-            mid_price_returns = reduce(torch.diff(torch.log((bid_px1 + ask_px1) / 2)))
+            mid_price_returns = reduce(torch_diff(torch.log((bid_px1 + ask_px1) / 2)))
 
             spread =  reduce(ask_px1 / bid_px1 - 1)  # TODO: mejor formula para el spread?
 
@@ -205,10 +209,10 @@ class OptiverDataModule(pl.LightningDataModule):
             ################################ Inspired on Technical Analysis ################################
 
             # Inspired on https://www.investopedia.com/terms/o/onbalancevolume.asp
-            OBV = reduce(((executed_qty[:,1:] * (torch.diff(executed_px) > 0)) - (executed_qty[:,1:] * (torch.diff(executed_px) < 0))) / stock_means)
+            OBV = reduce(((executed_qty[:,1:] * (torch_diff(executed_px) > 0)) - (executed_qty[:,1:] * (torch_diff(executed_px) < 0))) / texecqty_mean)
 
             # Inspired on https://www.investopedia.com/terms/f/force-index.asp
-            # force_index = reduce(torch.diff(torch.log(executed_px)) * executed_qty[:,1:] * 1e5 / stock_means)
+            # force_index = reduce(torch.diff(torch.log(executed_px)) * executed_qty[:,1:] * 1e5 / texecqty_mean)
 
             # TODO: ??????????
             # executed_qty_windows = executed_qty.unfold(1,kernel_size,1)
@@ -222,8 +226,8 @@ class OptiverDataModule(pl.LightningDataModule):
             
             money_flow = (executed_px * executed_qty)[:,1:]
 
-            money_flow_pos = money_flow * (torch.diff(executed_px) > 0)
-            money_flow_neg = money_flow * (torch.diff(executed_px) < 0)
+            money_flow_pos = money_flow * (torch_diff(executed_px) > 0)
+            money_flow_neg = money_flow * (torch_diff(executed_px) < 0)
 
             money_flow_pos_windows = money_flow_pos.unfold(1,kernel_size,1)
             money_flow_neg_windows = money_flow_neg.unfold(1,kernel_size,1)
@@ -232,7 +236,7 @@ class OptiverDataModule(pl.LightningDataModule):
             money_flow_neg_sums = torch.nansum(money_flow_neg_windows, axis=2)
 
             MFI = money_flow_pos_sums / (money_flow_pos_sums + money_flow_neg_sums)
-            MFI = reduce(torch.nan_to_num(MFI,nan=0.5))
+            MFI = reduce(torch_nan_to_num(MFI,nan=0.5))
 
             del money_flow_pos
             del money_flow_neg
@@ -250,8 +254,8 @@ class OptiverDataModule(pl.LightningDataModule):
 
             VWAP = torch.sum(money_flows_windows, axis=2) / torch.sum(executed_qty_windows, axis=2)
             VWAP = torch.tensor(pd.DataFrame(VWAP.cpu().numpy()).ffill(axis=1).values, device=device)
-            VWAP = torch.nan_to_num(VWAP) + torch.isnan(VWAP) * torch.nan_to_num(WAP[:,:VWAP.shape[1]])  # beginning of series
-            VWAP_returns = reduce(torch.diff(torch.log(VWAP)))
+            VWAP = torch_nan_to_num(VWAP) + torch.isnan(VWAP) * torch_nan_to_num(WAP[:,:VWAP.shape[1]])  # beginning of series
+            VWAP_returns = reduce(torch_diff(torch.log(VWAP)))
 
             del money_flows_windows
             del executed_qty_windows
@@ -292,7 +296,7 @@ class OptiverDataModule(pl.LightningDataModule):
             R = reduce(torch.pow(100 * (WAP[:,-moving_max.shape[1]:] - moving_max) / moving_max, 2))
 
             # Inspired on https://www.investopedia.com/articles/trading/08/accumulation-distribution-line.asp
-            CLV = torch.nan_to_num(((executed_px[:,-moving_min.shape[1]:] - moving_min) - (moving_max - executed_px[:,-moving_max.shape[1]:])) /       \
+            CLV = torch_nan_to_num(((executed_px[:,-moving_min.shape[1]:] - moving_min) - (moving_max - executed_px[:,-moving_max.shape[1]:])) /       \
                             (moving_max - moving_min), nan=0., posinf=0, neginf=0)
 
             # Inspired on ......
@@ -312,7 +316,7 @@ class OptiverDataModule(pl.LightningDataModule):
             lexqty = executed_qty[:,-CLV.shape[1]:]
             execlv_windows = (lexqty*CLV).unfold(1,kernel_size,1)
             vol_windows = lexqty.unfold(1,kernel_size,1)
-            CMF = torch.nan_to_num(torch.mean(execlv_windows, axis=2) / torch.mean(vol_windows, axis=2), nan=0., posinf=0, neginf=0)
+            CMF = torch_nan_to_num(torch.mean(execlv_windows, axis=2) / torch.mean(vol_windows, axis=2), nan=0., posinf=0, neginf=0)
 
             del executed_qty
             del lexqty
@@ -323,7 +327,7 @@ class OptiverDataModule(pl.LightningDataModule):
             CLV = reduce(CLV)
             CMF = reduce(CMF)
 
-            # executed_px_returns = reduce(torch.diff(torch.log(executed_px)))
+            executed_px_returns = reduce(torch_diff(torch.log(executed_px)))
 
             del executed_px
             del WAP
@@ -338,54 +342,21 @@ class OptiverDataModule(pl.LightningDataModule):
 
             torch.cuda.empty_cache()
 
-            nels = min(
-                        10000000000,
-
-                        moving_std.shape[1],
-                        realized_vol.shape[1],
-
-                        log_returns.shape[1],
-                        spread.shape[1],
-
-                        deepWAP_returns.shape[1],
-                        # executed_px_returns.shape[1],
-                        mid_price_returns.shape[1],
-                        VWAP_returns.shape[1],
-
-                        vol_total_diff.shape[1],
-                        vol_unbalance1.shape[1],
-                        vol_unbalance2.shape[1],
-                        vol_unbalance3.shape[1],
-
-                        OBV.shape[1],
-                        #force_index.shape[1],
-                        MFI.shape[1],
-                        bollinger_deviation.shape[1],
-                        R.shape[1],
-                        ATR.shape[1],
-                        donchian_deviation.shape[1],
-                        CLV.shape[1],
-                        CMF.shape[1],
-
-                        OLI1.shape[1],
-                        OLI2.shape[1]
-                        )
-
             processed.append(np.stack((
 
-                # Volume / liquidity (0.45)
-                # OLI1[:,-nels:],    
-                # OLI2[:,-nels:],
+                # # Volume / liquidity (0.45)
+                OLI1[:,-nels:],    
+                OLI2[:,-nels:],
                 # vol_total_diff[:,-nels:],
-                # vol_unbalance1[:,-nels:],
-                # vol_unbalance2[:,-nels:],
-                # vol_unbalance3[:,-nels:],
+                vol_unbalance1[:,-nels:],
+                vol_unbalance2[:,-nels:],
+                vol_unbalance3[:,-nels:],
 
                 # Returns (0.26)
                 log_returns[:,-nels:],    # 0.286 <----------------------
-                # deepWAP_returns[:,-nels:],    
-                # executed_px_returns[:,-nels:],    # 0.48
-                # mid_price_returns[:,-nels:],    # 0.46
+                deepWAP_returns[:,-nels:],    
+                executed_px_returns[:,-nels:],    # 0.48
+                mid_price_returns[:,-nels:],    # 0.46
                 VWAP_returns[:,-nels:],    # 0.38 <----------------------
 
                 # Volatility (0.27)
@@ -396,7 +367,7 @@ class OptiverDataModule(pl.LightningDataModule):
                 # Spreads (0.26)
                 spread[:,-nels:],    # 0.4 <----------------------
                 ATR[:,-nels:],   # 0.29 <----------------------
-                # R[:,-nels:],   # 0.38 <----------------------
+                R[:,-nels:],   # 0.38 <----------------------
 
                 # OBV[:,-nels:],   # 0.54
                 # force_index[:,-nels:],   # 0.51
@@ -411,11 +382,28 @@ class OptiverDataModule(pl.LightningDataModule):
             gc.collect()
 
         series = np.vstack(processed)
+        gc.collect()
 
         print('min:',list(np.round(np.min(series,axis=(0,2)),4)))
         print('max:',list(np.round(np.max(series,axis=(0,2)),4)))
 
-        self.series = (series - np.expand_dims(np.mean(series, axis=(0,2)),1)) / np.expand_dims(np.std(series, axis=(0,2)),1)
+        if len(series) > 1:
+
+            if settings['ENV'] == 'train':
+
+                series_means = np.expand_dims(np.mean(series, axis=(0,2)),1)
+                series_stds = np.expand_dims(np.std(series, axis=(0,2)),1)
+
+                np.save(settings['PREPROCESS_DIR'] +'series_means', series_means)
+                np.save(settings['PREPROCESS_DIR'] +'series_stds', series_stds)
+            else:
+
+                series_means = np.load(settings['PREPROCESS_DIR'] +'series_means.npy')
+                series_stds = np.load(settings['PREPROCESS_DIR'] +'series_stds.npy')
+
+            series = (series - series_means) / series_stds
+
+        self.series = series
 
         ###############################################################################
 
@@ -423,16 +411,16 @@ class OptiverDataModule(pl.LightningDataModule):
 
         l = series.shape[-1]
 
-        all_means = np.mean(series,axis=2)
-        hal_means = np.mean(series[:,:,-l//2:],axis=2)
-        qua_means = np.mean(series[:,:,-l//4:],axis=2)
-
-        # series_diff = np.diff(series, axis=2)
+        # stats[:,2,2+15] = np.mean(series,axis=2)
+        # stats[:,3] = np.mean(series[:,:,-l//2:],axis=2)
+        # stats[:,4] = np.mean(series[:,:,-l//4:],axis=2)
 
         # all_std = np.std(series,axis=2)
         # hal_std = np.std(series[:,:,-l//2:],axis=2)
         # qua_std = np.std(series[:,:,-l//4:],axis=2)
-    
+
+        # series_diff = np.diff(series, axis=2)
+
         # all_means_diff = np.mean(series_diff,axis=2)
         # hal_means_diff = np.mean(series_diff[:,:,-l//2:],axis=2)
         # qua_means_diff = np.mean(series_diff[:,:,-l//4:],axis=2)
@@ -441,100 +429,140 @@ class OptiverDataModule(pl.LightningDataModule):
         # hal_std_diff = np.std(series_diff[:,:,-l//2:],axis=2)
         # qua_std_diff = np.std(series_diff[:,:,-l//4:],axis=2)
 
-        # all_abmax = np.max(np.abs(series),axis=2)
-        # hal_abmax = np.max(np.abs(series[:,:,-l//2:]),axis=2)
-        # qua_abmax = np.max(np.abs(series[:,:,-l//4:]),axis=2)
+        # all_max = np.max(series,axis=2)
+        # hal_max = np.max(series[:,:,-l//2:],axis=2)
+        # qua_max = np.max(series[:,:,-l//4:],axis=2)
 
-        stats = np.hstack((
-                                all_means, hal_means, qua_means,
-                                #all_means_diff, hal_means_diff, qua_means_diff,
-                                #all_std, hal_std, qua_std,
-                                #all_std_diff, hal_std_diff, qua_std_diff,
-                                #all_abmax, hal_abmax, qua_abmax
-                            ))
+        # all_min = np.min(series,axis=2)
+        # hal_min = np.min(series[:,:,-l//2:],axis=2)
+        # qua_min = np.min(series[:,:,-l//4:],axis=2)
 
-        scaler = StandardScaler().fit(stats[targets[:,0] % 5 != 0])
-        self.stats = scaler.transform(stats)
+        if len(stats) > 1:
 
-        #TODO: correlations
+            if settings['ENV'] == 'train':
 
-        # for i in range(NUM_SERIES):
+                stats_means = np.mean(stats, axis=0)
+                stats_stds = np.std(stats, axis=0)
 
-        #     scaler = MinMaxScaler().fit(s[:,i].T)
-        #     s[:,i] = scaler.transform(s[:,i].T).T
+                np.save(settings['PREPROCESS_DIR'] +'stats_means', stats_means)
+                np.save(settings['PREPROCESS_DIR'] +'stats_stds', stats_stds)
+            else:
+
+                stats_means = np.load(settings['PREPROCESS_DIR'] +'stats_means.npy')
+                stats_stds = np.load(settings['PREPROCESS_DIR'] +'stats_stds.npy')
+
+            stats = (stats - stats_means) / stats_stds
+
+        self.stats = stats
 
         self.targets = targets
 
-        #TODO
-        #optim
-        #augmentation
+        assert((~np.isfinite(self.series)).sum() == 0)
+        assert((~np.isfinite(self.stats)).sum() == 0)
 
     def train_dataloader(self):
 
-        return DataLoader(SeriesDataSet(self.series, self.stats, self.targets[self.targets[:,0] % 5 != 0]), batch_size=512, shuffle=True)
+        #TODO: sorting por volatilidad
+        idx = self.targets[:,0] % 5 != self.CV_split
+        return DataLoader(SeriesDataSet(self.series[idx], self.stats[idx], self.targets[idx]), batch_size=512, shuffle=True)
 
     def val_dataloader(self):
 
-        return DataLoader(SeriesDataSet(self.series, self.stats, self.targets[self.targets[:,0] % 5 == 0]), batch_size=1024, shuffle=False)
-
-    def get_time_series(self):
-
-        series = []
-
-        targets = pd.read_csv(self.settings['ROOT_DATA'] + 'train.csv')
-        targets.loc[:,'tensor_index'] = np.nan
-        targets = targets.to_numpy(dtype=np.float32)
-
-        for folder in 'book_train.parquet', 'trade_train.parquet': 
-
-            file_paths = []
-            path_root = self.settings['ROOT_DATA'] + folder + '/'
-
-            for path, _, files in os.walk(path_root):
-                for name in files:
-                    file_paths.append(os.path.join(path, name))
-
-            for file_path in tqdm(file_paths):
-
-                df = pd.read_parquet(file_path, engine='pyarrow')
-                stock_id = int(file_path.split('\\')[-2].split('=')[-1])
-
-                for time_id in np.unique(df.time_id):
-
-                    df_time = df[df.time_id == time_id].reset_index(drop=True)
-                    with_changes_len = len(df_time)
-
-                    if 'book' in file_path:
-                        assert df_time.seconds_in_bucket[0] == 0
-
-                    df_time = df_time.reindex(list(range(600)))
-
-                    missing = set(range(600)) - set(df_time.seconds_in_bucket)
-                    df_time.loc[with_changes_len:,'seconds_in_bucket'] = list(missing)
-
-                    df_time = df_time.sort_values(by='seconds_in_bucket').reset_index(drop=True)
-
-                    if 'book' in file_path:
-
-                        df_time = df_time.iloc[:,2:].ffill(axis=0)
-                        targets[(targets[:,0]==stock_id) & (targets[:,1]==time_id), -1] = len(series)
-
-                        # For spans with no trades, values of traded_qty and traded_count are set to 0
-                        trades_columns = np.repeat(np.nan, 3*600).reshape(3,600).astype(np.float32)
-                        trades_columns[-2:] = 0.
-
-                        series.append(np.vstack((df_time.T.to_numpy(dtype=np.float32), trades_columns)))
-
-                    elif 'trade' in file_path:
-
-                        df_time = df_time.iloc[:,2:].fillna({'size':0, 'order_count':0}).ffill(axis=0)
-
-                        tensor_index = targets[(targets[:,0]==stock_id) & (targets[:,1]==time_id), -1].item()
-                        series[int(tensor_index)][-3:] = df_time.T.to_numpy(dtype=np.float32)
-
-        return series, targets
+        idx = self.targets[:,0] % 5 == self.CV_split
+        return DataLoader(SeriesDataSet(self.series[idx], self.stats[idx], self.targets[idx]), batch_size=1024, shuffle=False)
 
 
+
+def torch_diff(tensor, hack=False):
+
+    if hack:
+        return torch.tensor(np.diff(tensor.cpu().numpy()))
+    else:
+        return torch.diff(tensor)
+
+def torch_nan_to_num(tensor, nan=0., posinf=0., neginf=0., hack=False):
+
+    if hack:
+        return torch.tensor(np.nan_to_num(tensor.cpu().numpy(), nan=nan, posinf=posinf, neginf=neginf))
+    else:
+        return torch.nan_to_num(tensor, nan=nan, posinf=posinf, neginf=neginf)
+
+
+
+def get_time_series(settings):
+
+    series = []
+    vols = []
+
+    targets = pd.read_csv(settings['DATA_DIR'] + settings['ENV'] + '.csv')
+
+    for folder in 'book_'+settings['ENV']+'.parquet', 'trade_'+settings['ENV']+'.parquet': 
+
+        file_paths = []
+        path_root = settings['DATA_DIR'] + folder + '/'
+
+        for path, _, files in os.walk(path_root):
+            for name in files:
+                file_paths.append(os.path.join(path, name))
+
+        for file_path in tqdm(file_paths):
+
+            df = pd.read_parquet(file_path, engine='pyarrow')
+            slash = '\\' if platform.system() == 'Windows' else '/'
+            stock_id = int(file_path.split(slash)[-2].split('=')[-1])
+
+            for time_id in np.unique(df.time_id):
+
+                df_time = df[df.time_id == time_id].reset_index(drop=True)
+                with_changes_len = len(df_time)
+
+                # In kaggle public leaderboard, some books don't start with seconds_in_bucket=0
+                # if 'book' in file_path:
+                #     assert df_time.seconds_in_bucket[0] == 0
+
+                df_time = df_time.reindex(list(range(600)))
+
+                missing = set(range(600)) - set(df_time.seconds_in_bucket)
+                df_time.loc[with_changes_len:,'seconds_in_bucket'] = list(missing)
+
+                df_time = df_time.sort_values(by='seconds_in_bucket').reset_index(drop=True)
+
+                if 'book' in file_path:
+
+                    df_time = df_time.iloc[:,2:].ffill(axis=0)
+
+                    # In kaggle public leaderboard, some books don't start with seconds_in_bucket=0
+                    #TODO: workaround for https://www.kaggle.com/c/optiver-realized-volatility-prediction/discussion/251775
+                    df_time.bfill(axis=0, inplace=True)
+
+                    # For spans with no trades, values of traded_qty and traded_count are set to 0
+                    trades_columns = np.repeat(np.nan, 3*600).reshape(3,600).astype(np.float32)
+                    trades_columns[-2:] = 0.
+
+                    series.append(np.vstack((df_time.T.to_numpy(dtype=np.float32), trades_columns)))
+
+                    if 'target' in targets.columns:
+                        entry = targets.loc[(targets.stock_id==stock_id) & (targets.time_id==time_id), 'target']
+                    else:
+                        entrey = []
+
+                    vols.append(np.array((  stock_id, time_id, len(vols), 
+                                            entry.item() if len(entry)==1 else np.nan), dtype=np.float32))
+
+                elif 'trade' in file_path:
+
+                    if isinstance(vols, list):
+                        series = np.stack(series, axis=0)
+                        vols = np.stack(vols, axis=0)
+
+                    # Avg trade prices are only forward-filled, nan values will be replaced with WAP later
+                    df_time = df_time.iloc[:,2:].fillna({'size':0, 'order_count':0})
+                    df_time.ffill(axis=0, inplace=True)
+
+                    tensor_index = vols[(vols[:,0]==stock_id) & (vols[:,1]==time_id), 2].item()
+                    series[int(tensor_index),-3:] = df_time.T.to_numpy(dtype=np.float32)
+
+    return series, vols
 
 
 
@@ -550,13 +578,11 @@ class SeriesDataSet(Dataset):
 
     def __len__(self):
 
-        return len(self.targets)
+        return len(self.series)
 
     def __getitem__(self, idx):
 
-        series_index = int(self.targets[idx,-1])
-
-        return self.series[series_index], self.stats[series_index], self.targets[idx,-2]
+        return self.series[idx], self.stats[idx], self.targets[idx,-1]
 
 
 if __name__ == '__main__':
@@ -566,7 +592,7 @@ if __name__ == '__main__':
 
     data = OptiverDataModule()
 
-    # truth = pd.read_csv(ROOT_DATA+'train.csv')
+    # truth = pd.read_csv(DATA_DIR+'train.csv')
 
     # stockids = np.unique(truth.stock_id)
     # timeids  = np.unique(truth.time_id)
@@ -586,3 +612,9 @@ if __name__ == '__main__':
     pass
 
 
+        #TODO: correlations
+
+        # for i in range(NUM_SERIES):
+
+        #     scaler = MinMaxScaler().fit(s[:,i].T)
+        #     s[:,i] = scaler.transform(s[:,i].T).T

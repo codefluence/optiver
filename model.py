@@ -16,7 +16,7 @@ from utils import blend, smooth_bce, utility_score
 
 class PatternFinder(LightningModule):
 
-    def __init__(self, in_channels=4, multf=16):
+    def __init__(self, multf=4, in_channels=4):
 
         super(PatternFinder, self).__init__()
 
@@ -32,9 +32,9 @@ class PatternFinder(LightningModule):
 
         # self.avgpool_b = nn.AvgPool1d(kernel_size=15, stride=3)
         
-        self.block0 = Dablock(2, multf)
-        self.block1 = Dablock(2, multf)
-        self.block2 = Dablock(2, multf)
+        self.block0 = Dablock(in_channels//3, multf)
+        self.block1 = Dablock(in_channels//3, multf)
+        self.block2 = Dablock(in_channels//3, multf)
 
         input_width = in_channels*multf*2*2 * 1 * 3
 
@@ -45,9 +45,9 @@ class PatternFinder(LightningModule):
 
     def forward(self, series):
 
-        x0 = self.block0(series[:,:2])
-        x1 = self.block1(series[:,2:4])
-        x2 = self.block1(series[:,4:])
+        x0 = self.block0(series[:,:5])  # <----------- canales
+        x1 = self.block1(series[:,5:10])
+        x2 = self.block1(series[:,10:])
 
         x = torch.hstack((x0, x1, x2))
 
@@ -84,7 +84,7 @@ class PatternFinder(LightningModule):
 
     def configure_optimizers(self):
 
-        optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
+        optimizer = torch.optim.Adam(self.parameters(), lr=3e-3)
         sccheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=2, factor=1/3, verbose=True, min_lr=1e-5)
         return [optimizer], {'scheduler': sccheduler, 'monitor': 'val_monit'}
 
@@ -93,7 +93,7 @@ class PatternFinder(LightningModule):
 
 class Dablock(LightningModule):
 
-    def __init__(self, in_channels=4, multf=4):
+    def __init__(self, in_channels, multf):
 
         super(Dablock, self).__init__()
 

@@ -1,1 +1,4 @@
-{"ROOT_DATA": "D:/data/optiver/"}
+{   "DATA_DIR": "D:/data/optiver/",
+    "MODELS_DIR": "./checkpoints/",
+    "PREPROCESS_DIR": "./preprocessing/",
+    "ENV": "train"}
