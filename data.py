@@ -26,8 +26,8 @@ pd.set_option('display.max_rows', 600)
 
 class OptiverDataModule(pl.LightningDataModule):
 
-    def __init__(self, settings_path='./settings.json', device='cuda', nels=64,
-                 batch_size=50000, kernel_size=7, stride=5, CV_split=0):
+    def __init__(self, settings_path='./settings.json', device='cuda', scale=True, nels=243+8,
+                 batch_size=50000, kernel_size=3, stride=2, CV_split=0, m_kernel_size=30):
 
         super(OptiverDataModule, self).__init__()
 
@@ -68,15 +68,16 @@ class OptiverDataModule(pl.LightningDataModule):
 
 
 
-        print('processing exec qty stats...')
+        print('computing stock stats...')
 
         # total exec qty (time span)
-        stats = np.empty((len(series),2), dtype=np.float32)
+        stats = np.empty((len(series),3), dtype=np.float32)
         stats[:,0] = np.sum(series[:,9], axis=1)
 
         for i in np.unique(targets[:,0]):
             idx = targets[:,0] == int(i)
             stats[idx,1] = np.mean(stats[idx,0])
+
 
 
         print('processing series...')
@@ -119,7 +120,7 @@ class OptiverDataModule(pl.LightningDataModule):
 
         num_batches = math.ceil(len(series) / batch_size)
 
-        for bidx in range(num_batches):
+        for bidx in tqdm(range(num_batches)):
 
             start = bidx*batch_size
             end   = start + min(batch_size, len(series) - start)
@@ -141,7 +142,7 @@ class OptiverDataModule(pl.LightningDataModule):
             # executed_qty_dist =  reduce(np.divide(executed_qty, sumexecs))
             # executed_count_dist = reduce(np.divide(executed_count, np.expand_dims(np.sum(executed_count,axis=1),axis=1)))
 
-            texecqty_mean = torch.tensor(stats[:,1][start:end], device=device).unsqueeze(1)
+            texecqty_mean = torch.tensor(stats[start:end,1], device=device).unsqueeze(1)
 
             OLI1 = get_liquidityflow(bid_px1, bid_qty1 / texecqty_mean, True) + get_liquidityflow(ask_px1, ask_qty1 / texecqty_mean, False)
             OLI2 = get_liquidityflow(bid_px2, bid_qty2 / texecqty_mean, True) + get_liquidityflow(ask_px2, ask_qty2 / texecqty_mean, False)
@@ -187,8 +188,10 @@ class OptiverDataModule(pl.LightningDataModule):
             executed_px = torch_nan_to_num(executed_px) + torch.isnan(executed_px) * torch_nan_to_num(WAP)
 
             log_returns = torch_diff(torch.log(WAP))
+
+            stats[start:end,2] = torch.sqrt(torch.sum(torch.pow(log_returns,2),dim=1)).cpu().numpy()
             
-            log_returns_windows = log_returns.unfold(1,kernel_size,1)
+            log_returns_windows = log_returns.unfold(1,m_kernel_size,1)
             realized_vol = reduce(torch.sqrt(torch.sum(torch.pow(log_returns_windows,2),dim=2))) #TODO
 
             log_returns = reduce(log_returns)
@@ -215,7 +218,7 @@ class OptiverDataModule(pl.LightningDataModule):
             # force_index = reduce(torch.diff(torch.log(executed_px)) * executed_qty[:,1:] * 1e5 / texecqty_mean)
 
             # TODO: ??????????
-            # executed_qty_windows = executed_qty.unfold(1,kernel_size,1)
+            # executed_qty_windows = executed_qty.unfold(1,m_kernel_size,1)
             # moving_executed_qty = torch.mean(executed_qty_windows, axis=2)
             # effort = (executed_qty[:,1:] / log_returns) / moving_executed_qty
             # effort = torch.Tensor(torch.nan_to_num(effort))
@@ -229,8 +232,8 @@ class OptiverDataModule(pl.LightningDataModule):
             money_flow_pos = money_flow * (torch_diff(executed_px) > 0)
             money_flow_neg = money_flow * (torch_diff(executed_px) < 0)
 
-            money_flow_pos_windows = money_flow_pos.unfold(1,kernel_size,1)
-            money_flow_neg_windows = money_flow_neg.unfold(1,kernel_size,1)
+            money_flow_pos_windows = money_flow_pos.unfold(1,m_kernel_size,1)
+            money_flow_neg_windows = money_flow_neg.unfold(1,m_kernel_size,1)
 
             money_flow_pos_sums = torch.nansum(money_flow_pos_windows, axis=2)
             money_flow_neg_sums = torch.nansum(money_flow_neg_windows, axis=2)
@@ -249,8 +252,8 @@ class OptiverDataModule(pl.LightningDataModule):
 
             # Inspired on https://www.investopedia.com/terms/v/vwap.asp
 
-            money_flows_windows = money_flow.unfold(1,kernel_size,1)
-            executed_qty_windows = executed_qty[:,1:].unfold(1,kernel_size,1)
+            money_flows_windows = money_flow.unfold(1,m_kernel_size,1)
+            executed_qty_windows = executed_qty[:,1:].unfold(1,m_kernel_size,1)
 
             VWAP = torch.sum(money_flows_windows, axis=2) / torch.sum(executed_qty_windows, axis=2)
             VWAP = torch.tensor(pd.DataFrame(VWAP.cpu().numpy()).ffill(axis=1).values, device=device)
@@ -264,7 +267,7 @@ class OptiverDataModule(pl.LightningDataModule):
 
             ####
 
-            WAP_windows = WAP.unfold(1,kernel_size,1)
+            WAP_windows = WAP.unfold(1,m_kernel_size,1)
 
             moving_mean = torch.mean(WAP_windows, axis=2)
             moving_std = torch.std(WAP_windows, axis=2)
@@ -285,7 +288,7 @@ class OptiverDataModule(pl.LightningDataModule):
 
             ####
 
-            VWAP_windows = VWAP.unfold(1,kernel_size,1)
+            VWAP_windows = VWAP.unfold(1,m_kernel_size,1)
             moving_std_VWAP = reduce(torch.std(VWAP_windows, axis=2))
             del VWAP
             del VWAP_windows
@@ -314,8 +317,8 @@ class OptiverDataModule(pl.LightningDataModule):
 
             # Inspired on https://www.investopedia.com/terms/c/chaikinoscillator.asp
             lexqty = executed_qty[:,-CLV.shape[1]:]
-            execlv_windows = (lexqty*CLV).unfold(1,kernel_size,1)
-            vol_windows = lexqty.unfold(1,kernel_size,1)
+            execlv_windows = (lexqty*CLV).unfold(1,m_kernel_size,1)
+            vol_windows = lexqty.unfold(1,m_kernel_size,1)
             CMF = torch_nan_to_num(torch.mean(execlv_windows, axis=2) / torch.mean(vol_windows, axis=2), nan=0., posinf=0, neginf=0)
 
             del executed_qty
@@ -387,7 +390,7 @@ class OptiverDataModule(pl.LightningDataModule):
         print('min:',list(np.round(np.min(series,axis=(0,2)),4)))
         print('max:',list(np.round(np.max(series,axis=(0,2)),4)))
 
-        if len(series) > 1:
+        if scale and len(series) > 1:
 
             if settings['ENV'] == 'train':
 
@@ -407,7 +410,7 @@ class OptiverDataModule(pl.LightningDataModule):
 
         ###############################################################################
 
-        print('computing stats...')
+        print('computing series stats...')
 
         l = series.shape[-1]
 
@@ -437,7 +440,7 @@ class OptiverDataModule(pl.LightningDataModule):
         # hal_min = np.min(series[:,:,-l//2:],axis=2)
         # qua_min = np.min(series[:,:,-l//4:],axis=2)
 
-        if len(stats) > 1:
+        if scale and len(stats) > 1:
 
             if settings['ENV'] == 'train':
 

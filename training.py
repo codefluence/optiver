@@ -16,13 +16,12 @@ from model import VolatilityClassifier, PatternFinder
 from net1d import Net1D
 from resnet1d import ResNet1D
 
-def fit_model():
+def fit_model(CV_split):
 
-    data = OptiverDataModule()
+    data = OptiverDataModule(CV_split=CV_split)
 
     model = PatternFinder(in_channels=data.series.shape[1])
     #model = VolatilityClassifier(data.stats.shape[1])
-
     # model = ResNet1D(
     #                     in_channels=15, 
     #                     base_filters=15, 
@@ -35,14 +34,12 @@ def fit_model():
     #                     increasefilter_gap=max(3//4, 1), 
     #                     verbose=False)
 
-    filename = 'optiver-{epoch}-{val_monit:.4f}'
+    filename = 'optiver_CV5'+str(CV_split)
     dirpath='./checkpoints/'
-
-    print('time start:',datetime.now().strftime("%H:%M:%S"))
 
     early_stop_callback = EarlyStopping(
         monitor='val_monit',
-        patience=12,
+        patience=8,
         verbose=True,
         mode='min'
     )
@@ -67,14 +64,12 @@ def fit_model():
 
     trainer.fit(model, data)
 
-    print('time end:',datetime.now().strftime("%H:%M:%S"))
 
-
-def eval_model(checkpoint_name='optiver-cnn', device='cuda'):
+def eval_model(CV_split, device='cuda'):
 
     data = OptiverDataModule()
 
-    model = PatternFinder.load_from_checkpoint('./checkpoints/{}.ckpt'.format(checkpoint_name), in_channels=data.series.shape[1])
+    model = PatternFinder.load_from_checkpoint('./checkpoints/optiver_CV5{}.ckpt'.format(CV_split), in_channels=data.series.shape[1])
 
     model.cuda()
     model.eval()
@@ -107,5 +102,5 @@ def eval_model(checkpoint_name='optiver-cnn', device='cuda'):
 
 if __name__ == '__main__':
 
-    eval_model()
+    fit_model(0)
 

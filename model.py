@@ -16,7 +16,7 @@ from utils import blend, smooth_bce, utility_score
 
 class PatternFinder(LightningModule):
 
-    def __init__(self, multf=4, in_channels=4):
+    def __init__(self, in_channels, multf=2):
 
         super(PatternFinder, self).__init__()
 
@@ -32,11 +32,12 @@ class PatternFinder(LightningModule):
 
         # self.avgpool_b = nn.AvgPool1d(kernel_size=15, stride=3)
         
-        self.block0 = Dablock(in_channels//3, multf)
-        self.block1 = Dablock(in_channels//3, multf)
-        self.block2 = Dablock(in_channels//3, multf)
+        self.block0 = Dablock(in_channels, multf)
+        #self.block1 = Dablock(in_channels*3, multf//2)
+        self.block1 = Dablock(in_channels, multf)
+        self.block2 = Dablock(in_channels, multf, 2)
 
-        input_width = in_channels*multf*2*2 * 1 * 3
+        input_width = in_channels*multf**5 * 3
 
         # self.batch_norm1 = nn.BatchNorm1d(input_width)
         # self.head = nn.Linear(input_width, input_width)
@@ -45,16 +46,17 @@ class PatternFinder(LightningModule):
 
     def forward(self, series):
 
-        x0 = self.block0(series[:,:5])  # <----------- canales
-        x1 = self.block1(series[:,5:10])
-        x2 = self.block1(series[:,10:])
+        x0 = self.block0(series)
 
-        x = torch.hstack((x0, x1, x2))
+        #x1_a = F.avg_pool1d(series, kernel_size=3, stride=1, padding=1)
+        x1_b = F.avg_pool1d(series, kernel_size=5, stride=1, padding=2)
+        #x1_c = F.avg_pool1d(series, kernel_size=9, stride=1, padding=4)
+        #x1 = self.block1(torch.hstack((x1_a, x1_b, x1_c)))
+        x1 = self.block1(x1_b)
 
-        # x = self.batch_norm1(x)
-        # x = self.head(x)
-        # x = F.leaky_relu(x)
-        # x = F.dropout(x, p=0.2)
+        x2 = self.block2(series)
+
+        x = torch.hstack((x0,x1,x2))
 
         return self.linear(x), x
 
@@ -62,7 +64,7 @@ class PatternFinder(LightningModule):
 
         series, stats, targets = train_batch
 
-        logits = self.forward(series)[0]  #, stats.reshape(-1,1)
+        logits = self.forward(series)[0]
 
         loss = torch.sqrt(torch.mean(torch.square((targets - logits.squeeze()) / targets), dim=0))
 
@@ -93,61 +95,48 @@ class PatternFinder(LightningModule):
 
 class Dablock(LightningModule):
 
-    def __init__(self, in_channels, multf):
+    def __init__(self, in_channels, multf, dilation=1):
 
         super(Dablock, self).__init__()
 
         self.batchnorm = nn.BatchNorm1d(in_channels)
-        
-        self.conv1_a = nn.Conv1d(in_channels, in_channels*multf, kernel_size=4, stride=4, padding=0, bias=True)
-        self.conv2_a = nn.Conv1d(in_channels*multf, in_channels*multf*2, kernel_size=4, stride=4, padding=0, bias=True)
-        self.conv3_a = nn.Conv1d(in_channels*multf*2, in_channels*multf*2*2, kernel_size=4, stride=4, padding=0, bias=True)
 
-        self.conv1_b = nn.Conv1d(in_channels, in_channels*multf, kernel_size=3, stride=3, padding=0, bias=True)
-        self.conv2_b = nn.Conv1d(in_channels*multf, in_channels*multf*2, kernel_size=3, stride=3, padding=0, bias=True)
-        self.conv3_b = nn.Conv1d(in_channels*multf*2, in_channels*multf*2*2, kernel_size=3, stride=3, padding=0, bias=True)
+        self.ks = 3 if dilation==1 else 2
 
-        self.conv1_c = nn.Conv1d(in_channels, in_channels*multf, kernel_size=2, stride=2, padding=0, bias=True)
-        self.conv2_c = nn.Conv1d(in_channels*multf, in_channels*multf*2, kernel_size=2, stride=2, padding=0, bias=True)
-        self.conv3_c = nn.Conv1d(in_channels*multf*2, in_channels*multf*2*2, kernel_size=2, stride=2, padding=0, bias=True)
+        self.conv1 = nn.Conv1d(in_channels, in_channels*multf, kernel_size=self.ks, stride=1, padding=0, bias=True, dilation=dilation)
+        self.conv2 = nn.Conv1d(in_channels*multf, in_channels*multf**2, kernel_size=self.ks, stride=1, padding=0, bias=True, dilation=dilation**2)
+        self.conv3 = nn.Conv1d(in_channels*multf**2, in_channels*multf**3, kernel_size=self.ks, stride=1, padding=0, bias=True, dilation=dilation**3)
+
+        self.conv4 = nn.Conv1d(in_channels*multf**3, in_channels*multf**4, kernel_size=self.ks, stride=1, padding=0, bias=True, dilation=dilation)
+        self.conv5 = nn.Conv1d(in_channels*multf**3, in_channels*multf**4, kernel_size=3, stride=1, padding=0, bias=True, dilation=1)
+
 
     def forward(self, series):
 
         x = self.batchnorm(series)
-    
-        x_a = x[:,:,-64:]
-        x_b = x[:,:,-27:]
-        x_c = x[:,:,-8:]
 
-        x_a = self.conv1_a(x_a)
-        x_a = F.leaky_relu(x_a)
-        x_a = self.conv2_a(x_a)
-        x_a = F.leaky_relu(x_a)
-        x_a = self.conv3_a(x_a)
-        x_a = F.leaky_relu(x_a)
+        x = self.conv1(x)
+        x = F.leaky_relu(x)
+        x = F.avg_pool1d(x, kernel_size=3, stride=3)
 
-        x_b = self.conv1_b(x_b)
-        x_b = F.leaky_relu(x_b)
-        x_b = self.conv2_b(x_b)
-        x_b = F.leaky_relu(x_b)
-        x_b = self.conv3_b(x_b)
-        x_b = F.leaky_relu(x_b)
+        x = self.conv2(x)
+        x = F.leaky_relu(x)
+        x = F.avg_pool1d(x, kernel_size=3, stride=3)
 
-        x_c = self.conv1_c(x_c)
-        x_c = F.leaky_relu(x_c)
-        x_c = self.conv2_c(x_c)
-        x_c = F.leaky_relu(x_c)
-        x_c = self.conv3_c(x_c)
-        x_c = F.leaky_relu(x_c)
+        x = self.conv3(x)
+        x = F.leaky_relu(x)
+        x = F.avg_pool1d(x, kernel_size=3, stride=3)
 
-        # x_a = x_a[:,:,1] - x_a[:,:,0]
-        # x_c = x_c[:,:,1] - x_c[:,:,0]
+        if self.ks == 3:
+            x = self.conv4(x)
+            x = F.leaky_relu(x)
+            x = F.avg_pool1d(x, kernel_size=3, stride=3)
+        else:
+            x = self.conv5(x)
+            x = F.leaky_relu(x)
+            x = F.avg_pool1d(x, kernel_size=2, stride=2)
 
-        x_a = torch.flatten(x_a, start_dim=1, end_dim=2)
-        x_b = torch.flatten(x_b, start_dim=1, end_dim=2)
-        x_c = torch.flatten(x_c, start_dim=1, end_dim=2)
-
-        return torch.hstack((x_a, x_b, x_c))
+        return torch.flatten(x, start_dim=1, end_dim=2)
 
 
 
