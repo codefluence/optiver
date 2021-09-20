@@ -26,15 +26,14 @@ pd.set_option('display.max_rows', 600)
 
 class OptiverDataModule(pl.LightningDataModule):
 
-    def __init__(self, settings_path='./settings.json', device='cuda', scale=True, nels=243+8,
-                 batch_size=50000, kernel_size=3, stride=2, CV_split=0):
+    def __init__(self, settings_path='./settings.json', device='cuda', batch_size=50000, scale=True,
+                 horizon=-243-8, kernel_size=3, stride=2, m_kernel_sizes=[60,30,15], CV_split=0):
 
         super(OptiverDataModule, self).__init__()
 
         self.CV_split = CV_split
 
         epsilon = 1e-6
-        m_kernel_sizes = [60,30,15]
 
         with open(settings_path) as f:
             
@@ -73,7 +72,8 @@ class OptiverDataModule(pl.LightningDataModule):
 
         # total exec qty (time span)
         stats = np.empty((len(series),3), dtype=np.float32)
-        stats[:,0] = np.sum(series[:,9], axis=1)
+        stats[:] = np.nan
+        stats[:,0] = np.sum(series[:,9], axis=1)  # sum of executed_qty
 
         for i in np.unique(targets[:,0]):
             idx = targets[:,0] == int(i)
@@ -95,7 +95,7 @@ class OptiverDataModule(pl.LightningDataModule):
 
             assert((~ np.isfinite(copy)).sum() == 0)
 
-            return copy
+            return copy[:,horizon:]
 
         # Inspired on ...
         def get_liquidityflow(prices, qties, isbuy):
@@ -415,23 +415,23 @@ class OptiverDataModule(pl.LightningDataModule):
 
             processed.append(np.stack((
 
-                log_returns[:,-nels:],
-                moving_stds[0][:,-nels:],
-                moving_stds[1][:,-nels:],
-                moving_stds[2][:,-nels:],
-                moving_std_mean[:,-nels:],
-                moving_std_std[:,-nels:],
-                moving_stds_diff[0][:,-nels:],
-                moving_stds_diff[1][:,-nels:],
-                moving_stds_diff[2][:,-nels:],
-                moving_std_diff_mean[:,-nels:],
-                moving_std_diff_std[:,-nels:],
+                log_returns[:,horizon:],
+                moving_stds[0][:,horizon:],#60
+                moving_stds[1][:,horizon:],#30
+                moving_stds[2][:,horizon:],#15
+                moving_std_mean[:,horizon:],
+                moving_std_std[:,horizon:],
+                moving_stds_diff[0][:,horizon:],
+                moving_stds_diff[1][:,horizon:],
+                moving_stds_diff[2][:,horizon:],
+                moving_std_diff_mean[:,horizon:],
+                moving_std_diff_std[:,horizon:],
 
                 # # Volume / liquidity (0.45)
-                # OLI1[:,-nels:],    
-                # OLI2[:,-nels:],
-                # moving_OLIs[0][:,-nels:] - moving_OLIs[1][:,-nels:],
-                # moving_OLIs[1][:,-nels:] - moving_OLIs[2][:,-nels:],
+                OLI1[:,horizon:],    
+                OLI2[:,horizon:],
+                moving_OLIs[1][:,horizon:] - moving_OLIs[0][:,horizon:],
+                moving_OLIs[2][:,horizon:]- moving_OLIs[1][:,horizon:],
                 # vol_total_diff[:,-nels:],
                 # vol_unbalance1[:,-nels:],
                 # vol_unbalance2[:,-nels:],
@@ -442,7 +442,7 @@ class OptiverDataModule(pl.LightningDataModule):
                 # deepWAP_returns[:,-nels:],    
                 # executed_px_returns[:,-nels:],    # 0.48
                 # mid_price_returns[:,-nels:],    # 0.46
-                # VWAP_returns[:,-nels:],    # 0.38 <----------------------
+                VWAP_returns[:,horizon:],    # 0.38 <----------------------
 
                 # # Volatility (0.27)
                 # moving_stds[0][:,-nels:] - moving_stds[1][:,-nels:],
@@ -456,16 +456,16 @@ class OptiverDataModule(pl.LightningDataModule):
 
                 # # Spreads (0.26)
                 # spread[:,-nels:],    # 0.4 <----------------------
-                # ATR[:,-nels:],   # 0.29 <----------------------
+                ATR[:,horizon:],   # 0.29 <----------------------
                 # R[:,-nels:],   # 0.38 <----------------------
 
-                # OBV[:,-nels:],   # 0.54
+                OBV[:,horizon:],   # 0.54
                 #force_index[:,-nels:],   # 0.51
-                # MFI[:,-nels:],   # 0.53
-                # bollinger_deviation[:,-nels:],   # 0.53
-                # donchian_deviation[:,-nels:],   # 0.53
-                # CLV[:,-nels:],   # 0.53
-                # CMF[:,-nels:],   # 0.53
+                MFI[:,horizon:],   # 0.53
+                bollinger_deviation[:,horizon:],   # 0.53
+                donchian_deviation[:,horizon:],   # 0.53
+                CLV[:,horizon:],   # 0.53
+                CMF[:,horizon:],   # 0.53
 
             ), axis=1))
 
@@ -497,41 +497,85 @@ class OptiverDataModule(pl.LightningDataModule):
 
         ###############################################################################
 
+        print('computing targets...')
+
+        fut_rea_vol = targets[:,3]
+        past_rea_vol = stats[:,2]
+        rea_vol_delta = fut_rea_vol - past_rea_vol
+        rea_vol_increase = fut_rea_vol / past_rea_vol - 1
+
+        targets = np.hstack((   targets,
+                                np.expand_dims(past_rea_vol,1),
+                                np.expand_dims(rea_vol_delta,1),
+                                np.expand_dims(rea_vol_increase,1)
+                            ))
+
         print('computing series stats...')
 
-        l = series.shape[-1]
+        print('non-series stats')
+        corrs = np.corrcoef(np.hstack((stats, np.expand_dims(targets[:,-1],1))).T)[:-1,-1]
+        print(np.round(corrs,2))
+        print()
 
-        # stats[:,3:3+10] = np.mean(series,axis=2)
-        # stats[:,3+10:3+20] = np.mean(series[:,:,-l//2:],axis=2)
-        # stats[:,3+20:3+30] = np.mean(series[:,:,-l//4:],axis=2)
+        stats_h = []
 
-        # stats[:,3+30:3+40] = np.std(series,axis=2)
-        # stats[:,3+40:3+50] = np.std(series[:,:,-l//2:],axis=2)
-        # stats[:,3+50:3+60] = np.std(series[:,:,-l//4:],axis=2)
+        #l = series.shape[-1]
+        h = [horizon, horizon//2, horizon//4]
+        stat_funcs = [np.mean, np.std, np.max, np.min] # diff, np.mean(series_diff[:,:,h:, np.std(series_diff[
 
-        # series_diff = np.diff(series, axis=2)
+        #for s in series, np.diff(series, axis=2, prepend=np.array(1., dtype=np.float32)):
+        s = series
+        for f in stat_funcs:
 
-        # all_means_diff = np.mean(series_diff,axis=2)
-        # hal_means_diff = np.mean(series_diff[:,:,-l//2:],axis=2)
-        # qua_means_diff = np.mean(series_diff[:,:,-l//4:],axis=2)
+            f0 = f(s[:,:,h[0]:],axis=2)
+            f1 = f(s[:,:,h[1]:],axis=2)
+            f2 = f(s[:,:,h[2]:],axis=2)
 
-        # all_std_diff = np.std(series_diff,axis=2)
-        # hal_std_diff = np.std(series_diff[:,:,-l//2:],axis=2)
-        # qua_std_diff = np.std(series_diff[:,:,-l//4:],axis=2)
+            f0 = f(s[:,:,h[0]:],axis=2)
+            f1 = f(s[:,:,h[1]:],axis=2)
+            f2 = f(s[:,:,h[2]:],axis=2)
 
-        # all_max = np.max(series,axis=2)
-        # hal_max = np.max(series[:,:,-l//2:],axis=2)
-        # qua_max = np.max(series[:,:,-l//4:],axis=2)
+            stats_h.append(np.hstack(( f0, f1, f2, f1 - f0, f2 - f0 )))
 
-        # all_min = np.min(series,axis=2)
-        # hal_min = np.min(series[:,:,-l//2:],axis=2)
-        # qua_min = np.min(series[:,:,-l//4:],axis=2)
+            corrs = np.corrcoef(np.hstack((stats_h[-1], np.expand_dims(targets[:,-1],1))).T)[:-1,-1]
 
-        #TODO: Si normalizo stats[:,2] el real_vol_delta se va a la mierda
-        if False and scale and len(stats) > 1:
+            print('stat_func:',str(f).split(' ')[1])
+            print('corrs:',np.round(corrs,2))
+            print()
+
+        stats_h.append(stats)
+        stats = np.hstack(stats_h)
+
+        # w = series.shape[1] * len(stat_funcs)
+        # i = 0
+        # w = 11
+
+        # for h in range(len(horizons)):
+        #     for s in range(len(stat_funcs)):
+
+        #         # 11 series * 4 stats * 3 horzons + 3 variables
+        #         view = stats[:,i*11:(i+1)*11]
+        #         corrs = np.corrcoef(np.hstack((view, np.expand_dims(targets[:,-1],1))).T)[:-1,-1]
+        #         print('columns',i*11,(i+1)*11)
+        #         print('horizon:',horizons[h])
+        #         print('stat_func:',str(stat_funcs[s]).split(' ')[1])
+        #         print('corrs:',np.round(corrs,2))
+        #         print('corrs abs mean:',np.round(np.mean(np.abs(corrs)),2))
+        #         print()
+        #         i += 1
+
+        corrs = np.corrcoef(np.hstack((stats, np.expand_dims(targets[:,-1],1))).T)[:-1,-1]
+        print(np.round(np.sort(np.abs(corrs)),2))
+
+        THRESHOLD = 0.24
+        stats = stats[:,np.abs(corrs)>THRESHOLD]
+        print('final shape',stats.shape)
+
+        if scale and len(stats) > 1:
 
             if settings['ENV'] == 'train':
 
+                #TODO: usar solo los datos del train set
                 stats_means = np.mean(stats, axis=0)
                 stats_stds = np.std(stats, axis=0)
 
@@ -546,6 +590,9 @@ class OptiverDataModule(pl.LightningDataModule):
 
         self.stats = stats
 
+        print('coeffs de las columnas seleccionadas')
+        print(np.round(np.abs(np.corrcoef(np.hstack((stats, np.expand_dims(targets[:,-1],1))).T)[:-1,-1]),2))
+        
         self.targets = targets
 
         assert((~np.isfinite(self.series)).sum() == 0)
@@ -554,7 +601,7 @@ class OptiverDataModule(pl.LightningDataModule):
     def train_dataloader(self):
 
         #TODO: sorting por volatilidad
-        idx = self.targets[:,0] % 5 != self.CV_split
+        idx = self.targets[:,0] % 5 == self.CV_split
         return DataLoader(SeriesDataSet(self.series[idx], self.stats[idx], self.targets[idx]), batch_size=512, shuffle=True)
 
     def val_dataloader(self):
@@ -673,7 +720,7 @@ class SeriesDataSet(Dataset):
 
     def __getitem__(self, idx):
 
-        return self.series[idx], self.stats[idx], self.targets[idx,-1]
+        return self.series[idx], self.stats[idx], self.targets[idx]
 
 
 if __name__ == '__main__':

@@ -16,7 +16,7 @@ from utils import blend, smooth_bce, utility_score
 
 class PatternFinder(LightningModule):
 
-    def __init__(self, in_channels, multf=6):
+    def __init__(self, in_channels, multf=4):
 
         super(PatternFinder, self).__init__()
 
@@ -25,10 +25,10 @@ class PatternFinder(LightningModule):
         self.block1 = Dablock(in_channels, multf)
         self.block2 = Dablock(in_channels, multf, dilation=2)
 
-        input_width = in_channels*multf*4 * 2 * 3
+        input_width = in_channels*multf*4 * 1 * 3
 
-        #self.head = nn.Linear(input_width, input_width)
-        self.linear_reg = nn.Linear(input_width, 1)
+        self.head = nn.Linear(input_width, input_width//2)
+        self.linear_reg = nn.Linear(input_width//2, 1)
 
         self.loss = nn.MSELoss()
 
@@ -36,7 +36,7 @@ class PatternFinder(LightningModule):
 
         return torch.sqrt(torch.sum(weight * (input - target)**2) / torch.sum(weight))
 
-    def forward(self, series, stats):
+    def forward(self, series):
 
         x0 = self.block0(series)
 
@@ -50,22 +50,21 @@ class PatternFinder(LightningModule):
 
         x = torch.hstack((x0,x1,x2)) #,stats[:,2].unsqueeze(1)
 
-        #x = self.head(x)
+        x = self.head(x)
         #x = F.dropout(x, p=0.2)
 
         return self.linear_reg(x), x
 
     def training_step(self, train_batch, batch_idx):
 
-        series, stats, rea_vols = train_batch
+        series, _, targets = train_batch
 
-        targets = rea_vols / stats[:,2]  - 1
+        increase = targets[:,-1]
+        logits = self.forward(series)[0]
 
-        logits = self.forward(series, stats)[0]
-
-        #loss = torch.sqrt(torch.mean(torch.square((targets - logits.squeeze()) / targets), dim=0))
-        loss = self.loss(logits.squeeze(), targets)
-        #loss = self.RMSE(logits.squeeze(), targets, 1 / (targets)**2)
+        #loss = torch.sqrt(torch.mean(torch.square((increase - logits.squeeze()) / increase), dim=0))
+        loss = self.loss(logits.squeeze(), increase)
+        #loss = self.RMSE(logits.squeeze(), increase, 1 / (increase)**2)
 
         self.log('train_loss', loss)
 
@@ -73,32 +72,33 @@ class PatternFinder(LightningModule):
 
     def validation_step(self, val_batch, batch_idx):
 
-        series, stats, rea_vols = val_batch
+        series, _, targets = val_batch
 
-        targets = rea_vols / stats[:,2]  - 1
+        increase = targets[:,-1]
+        logits = self.forward(series)[0]  #,stats.reshape(-1,1)
 
-        logits = self.forward(series, stats)[0]  #,stats.reshape(-1,1)
+        #loss = torch.sqrt(torch.mean(torch.square((increase - logits.squeeze()) / increase), dim=0)).cpu().item()
+        loss = self.loss(logits.squeeze(), increase).cpu().item()
+        #loss = self.RMSE(logits.squeeze(), increase, 1 / (increase)**2).cpu().item()
 
-        #loss = torch.sqrt(torch.mean(torch.square((targets - logits.squeeze()) / targets), dim=0))
-        loss = self.loss(logits.squeeze(), targets)
-        #loss = self.RMSE(logits.squeeze(), targets, 1 / (targets)**2)
+        mae = torch.mean(torch.abs(logits.squeeze() - increase)).cpu().item()
 
-        mae = torch.mean(torch.abs(logits.squeeze() - targets)).cpu().item()
-
-        self.log('val_loss', loss.cpu().item())
+        self.log('val_loss', loss)
         self.log('val_mae', mae)
 
         if batch_idx==0:
             #TODO: nograd needed?
-            estim = stats[:,2] * (1 + logits.squeeze())
-            rmspe = torch.sqrt(torch.mean(torch.square((rea_vols - estim) / rea_vols), dim=0)).cpu().item()
+            past_rea_vol = targets[:,-3]
+            fut_rea_vol  = targets[:,-4]
+            fut_rea_vol_estim = past_rea_vol * (1 + logits.squeeze())
+            rmspe = torch.sqrt(torch.mean(torch.square((fut_rea_vol - fut_rea_vol_estim) / fut_rea_vol), dim=0)).cpu().item()
             print()
             print(  f'\033[93m-------',
                     'val_rmspe', np.round(rmspe,3),
-                    '| val_loss', np.round(loss.cpu().item(),3),
+                    '| val_loss', np.round(loss,3),
                     '| val_mae',np.round(mae,3),
-                    '| mean(truth)',np.round(torch.mean(torch.abs(targets)).cpu().item(),2),
-                    'median(truth)',np.round(torch.median(torch.abs(targets)).cpu().item(),2),
+                    '| mean(truth)',np.round(torch.mean(torch.abs(increase)).cpu().item(),2),
+                    'median(truth)',np.round(torch.median(torch.abs(increase)).cpu().item(),2),
                     f'-------\033[0m')
 
 
@@ -126,12 +126,17 @@ class Dablock(LightningModule):
 
         self.ks = 3 if dilation==1 else 2
 
-        self.conv0 = nn.Conv1d(in_channels, in_channels*multf, kernel_size=self.ks, stride=1, padding=0, bias=True, dilation=dilation)
-        self.conv1 = nn.Conv1d(in_channels*multf, in_channels*multf*2, kernel_size=self.ks, stride=1, padding=0, bias=True, dilation=dilation**2)
-        self.conv2 = nn.Conv1d(in_channels*multf*2, in_channels*multf*3, kernel_size=self.ks, stride=1, padding=0, bias=True, dilation=dilation**3)
+        self.conv00 = nn.Conv1d(in_channels, in_channels*multf, kernel_size=self.ks, stride=1, padding=0, bias=True, dilation=dilation)
+        self.conv01 = nn.Conv1d(in_channels*multf, in_channels*multf, kernel_size=self.ks, stride=1, padding=0, bias=True, dilation=dilation)
 
-        self.conv3a = nn.Conv1d(in_channels*multf*3, in_channels*multf*4, kernel_size=self.ks, stride=1, padding=0, bias=True, dilation=dilation)
-        self.conv3b = nn.Conv1d(in_channels*multf*3, in_channels*multf*4, kernel_size=3, stride=1, padding=0, bias=True, dilation=1)
+        self.conv10 = nn.Conv1d(in_channels*multf, in_channels*multf*2, kernel_size=self.ks, stride=1, padding=0, bias=True, dilation=dilation**2)
+        self.conv11 = nn.Conv1d(in_channels*multf*2, in_channels*multf*2, kernel_size=self.ks, stride=1, padding=0, bias=True, dilation=dilation**2)
+
+        self.conv20 = nn.Conv1d(in_channels*multf*2, in_channels*multf*3, kernel_size=self.ks, stride=1, padding=0, bias=True, dilation=dilation**3)
+        self.conv21 = nn.Conv1d(in_channels*multf*3, in_channels*multf*3, kernel_size=self.ks, stride=1, padding=0, bias=True, dilation=dilation**3)
+
+        self.conv3a = nn.Conv1d(in_channels*multf*3, in_channels*multf*4, kernel_size=self.ks, stride=1, padding=0, bias=True)
+        self.conv3b = nn.Conv1d(in_channels*multf*3, in_channels*multf*4, kernel_size=3, stride=3, padding=0, bias=True)
 
     def channel_dropout(self, x):
 
@@ -146,32 +151,38 @@ class Dablock(LightningModule):
 
         x = self.batchnorm0(series)
 
-        x = self.conv0(x)
+        x = self.conv00(x)
         x = F.leaky_relu(x)
-        x = F.avg_pool1d(x, kernel_size=3, stride=3)
+        x = self.conv01(x)
+        x = F.leaky_relu(x)
+        x = F.avg_pool1d(x, kernel_size=self.ks, stride=self.ks)
         #x = self.channel_dropout(x)
 
         #x = self.batchnorm1(x)
-        x = self.conv1(x)
+        x = self.conv10(x)
         x = F.leaky_relu(x)
-        x = F.avg_pool1d(x, kernel_size=3, stride=3)
+        x = self.conv11(x)
+        x = F.leaky_relu(x)
+        x = F.avg_pool1d(x, kernel_size=self.ks, stride=self.ks)
         #x = self.channel_dropout(x)
 
         #x = self.batchnorm2(x)
-        x = self.conv2(x)
+        x = self.conv20(x)
         x = F.leaky_relu(x)
-        x = F.avg_pool1d(x, kernel_size=3, stride=3)
+        x = self.conv21(x)
+        x = F.leaky_relu(x)
+        x = F.avg_pool1d(x, kernel_size=self.ks, stride=self.ks)
         #x = self.channel_dropout(x)
 
         #x = self.batchnorm3(x)
         if self.ks == 3:
             x = self.conv3a(x)
             x = F.leaky_relu(x)
-            x = F.avg_pool1d(x, kernel_size=3, stride=3)
+            x = F.avg_pool1d(x, kernel_size=self.ks, stride=self.ks)
         else:
             x = self.conv3b(x)
             x = F.leaky_relu(x)
-            x = F.avg_pool1d(x, kernel_size=2, stride=2)
+            x = F.avg_pool1d(x, kernel_size=4, stride=4)
         #x = self.channel_dropout(x)
 
         return torch.flatten(x, start_dim=1, end_dim=2)
@@ -186,9 +197,6 @@ class VolatilityClassifier(LightningModule):
 
         super(VolatilityClassifier, self).__init__()
 
-        #self.dense0 = nn.Linear(4320, 8)
-
-        input_width = input_width - 3
         hidden_size = input_width*2
 
         self.batch_norm1 = nn.BatchNorm1d(input_width)
@@ -225,12 +233,12 @@ class VolatilityClassifier(LightningModule):
 
     def training_step(self, train_batch, batch_idx):
 
-        _, stats, rea_vols = train_batch
+        _, stats, targets = train_batch
 
-        logits = self.forward(stats[:,3:])
-        targets = rea_vols / stats[:,2]  - 1
+        increase = targets[:,-1]
+        logits = self.forward(stats)
 
-        loss = self.loss(logits.squeeze(), targets)
+        loss = self.loss(logits.squeeze(), increase)
 
         self.log('train_loss', loss)
 
@@ -238,22 +246,32 @@ class VolatilityClassifier(LightningModule):
 
     def validation_step(self, val_batch, batch_idx):
 
-        _, stats, rea_vols = val_batch
+        _, stats, targets = val_batch
 
-        logits = self.forward(stats[:,3:])
-        targets = rea_vols / stats[:,2]  - 1
+        increase = targets[:,-1]
+        logits = self.forward(stats)
 
-        loss = self.loss(logits.squeeze(), targets)
+        loss = self.loss(logits.squeeze(), increase).cpu().item()
 
-        self.log('val_loss', loss.cpu().item())
+        mae = torch.mean(torch.abs(logits.squeeze() - increase)).cpu().item()
+
+        self.log('val_loss', loss)
+        self.log('val_mae', mae)
 
         if batch_idx==0:
-            estim = stats[:,2] * (1 + logits.squeeze())
-            rmspe = torch.sqrt(torch.mean(torch.square((rea_vols - estim) / rea_vols), dim=0)).cpu().item()
-            mae = torch.mean(torch.abs(logits.squeeze() - targets))
+            #TODO: nograd needed?
+            past_rea_vol = targets[:,-3]
+            fut_rea_vol  = targets[:,-4]
+            fut_rea_vol_estim = past_rea_vol * (1 + logits.squeeze())
+            rmspe = torch.sqrt(torch.mean(torch.square((fut_rea_vol - fut_rea_vol_estim) / fut_rea_vol), dim=0)).cpu().item()
             print()
-            print('------- val_rmspe', np.round(rmspe,3),', val_loss', np.round(loss.cpu().item(),6),', mae',mae.cpu().item(),' -------')
-
+            print(  f'\033[93m-------',
+                    'val_rmspe', np.round(rmspe,3),
+                    '| val_loss', np.round(loss,3),
+                    '| val_mae',np.round(mae,3),
+                    '| mean(truth)',np.round(torch.mean(torch.abs(increase)).cpu().item(),2),
+                    'median(truth)',np.round(torch.median(torch.abs(increase)).cpu().item(),2),
+                    f'-------\033[0m')
 
 
     def configure_optimizers(self):

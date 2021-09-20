@@ -20,8 +20,8 @@ def fit_model(CV_split):
 
     data = OptiverDataModule(CV_split=CV_split)
 
-    model = PatternFinder(in_channels=data.series.shape[1])
-    #model = VolatilityClassifier(data.stats.shape[1])
+    # model = PatternFinder(in_channels=data.series.shape[1])
+    model = VolatilityClassifier(data.stats.shape[1])
     # model = ResNet1D(
     #                     in_channels=15, 
     #                     base_filters=15, 
