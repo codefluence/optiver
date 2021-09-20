@@ -38,8 +38,8 @@ def fit_model(CV_split):
     dirpath='./checkpoints/'
 
     early_stop_callback = EarlyStopping(
-        monitor='val_monit',
-        patience=8,
+        monitor='val_mae',
+        patience=12,
         verbose=True,
         mode='min'
     )
@@ -49,7 +49,7 @@ def fit_model(CV_split):
         filename=filename,
         save_top_k=1,
         verbose=True,
-        monitor='val_monit',
+        monitor='val_mae',
         mode='min'
     )
 
