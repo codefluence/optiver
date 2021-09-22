@@ -57,7 +57,7 @@ class PatternFinder(LightningModule):
 
     def training_step(self, train_batch, batch_idx):
 
-        series, _, targets = train_batch
+        series, _, _, targets = train_batch
 
         increase = targets[:,-1]
         logits = self.forward(series)[0]
@@ -72,7 +72,7 @@ class PatternFinder(LightningModule):
 
     def validation_step(self, val_batch, batch_idx):
 
-        series, _, targets = val_batch
+        series, _, _, targets = val_batch
 
         increase = targets[:,-1]
         logits = self.forward(series)[0]  #,stats.reshape(-1,1)
@@ -233,7 +233,7 @@ class VolatilityClassifier(LightningModule):
 
     def training_step(self, train_batch, batch_idx):
 
-        _, stats, targets = train_batch
+        _, _, stats, targets = train_batch
 
         increase = targets[:,-1]
         logits = self.forward(stats)
@@ -246,7 +246,7 @@ class VolatilityClassifier(LightningModule):
 
     def validation_step(self, val_batch, batch_idx):
 
-        _, stats, targets = val_batch
+        _, _, stats, targets = val_batch
 
         increase = targets[:,-1]
         logits = self.forward(stats)
