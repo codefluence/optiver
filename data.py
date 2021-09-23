@@ -19,6 +19,10 @@ from torch.utils.data import DataLoader, Dataset
 
 from sklearn.preprocessing import MinMaxScaler
 
+from scipy.signal import find_peaks
+from scipy.interpolate import interp1d
+from scipy.signal import argrelmax
+
 np.set_printoptions(threshold=2000, linewidth=140, precision=6, edgeitems=20, suppress=1)
 pd.set_option('display.max_rows', 600)
 
@@ -27,7 +31,7 @@ pd.set_option('display.max_rows', 600)
 class OptiverDataModule(pl.LightningDataModule):
 
     def __init__(self, settings_path='./settings.json', device='cuda', batch_size=50000, scale=True,
-                 kernel_size=3, stride=2, m_kernel_sizes=[30], CV_split=0):
+                 kernel_size=5, stride=5, mks=30, CV_split=0):
 
         super(OptiverDataModule, self).__init__()
 
@@ -69,6 +73,11 @@ class OptiverDataModule(pl.LightningDataModule):
 
 
 
+        # series  = series[:100000]
+        # targets = targets[:100000]
+
+
+
         print('computing stock stats...')
 
         stats = np.empty((len(series),3), dtype=np.float32)
@@ -95,24 +104,42 @@ class OptiverDataModule(pl.LightningDataModule):
 
             batch = []
 
-            def reduce(array):
-                return None
+            def get_signals(array, upper_th, lower_th):
+
+                
+                pass
 
             def process(array):
+
+                #######################################
+                batch.extend(F.avg_pool1d(array.unsqueeze(0), kernel_size=kernel_size, stride=stride).squeeze(0).cpu().numpy().copy())
+                return#######################################
+
 
                 results = []
                 results.append(array)
 
-                for mks in m_kernel_sizes:
+                #TODO: torch.cumsum(array, dim=1)
+                windows = array.unfold(1,mks,1)
 
-                    windows = torch.cumsum(array, dim=1).unfold(1,mks,1)
+                results.append(torch.mean(windows, dim=2))
+                results.append(torch.std(windows, dim=2))
+                results.append(torch.max(windows, dim=2)[0] - torch.min(windows, dim=2)[0])
+                #results.append(torch.max(torch.abs(windows), dim=2)[0])
+                results.append(torch.max(windows, dim=2)[0])
 
-                    results.append(torch.mean(windows, dim=2))
-                    results.append(torch.std(windows, dim=2))
-                    results.append(torch.max(windows, dim=2)[0] - torch.min(windows, dim=2)[0])
-                    results.append(torch.max(torch.abs(windows), dim=2)[0])
+                # empty = torch.zeros((array.shape[0],array.shape[1]-1), device='cuda')
+                # empty[:] = np.nan
+                # reversedextended = torch.flip(torch.hstack((array,empty)),dims=(1,))
+                # windows = reversedextended.unfold(1,array.shape[1],1).cpu().numpy()
+                # torch.cuda.empty_cache()
 
-                    del windows
+                # md = np.nanmean(windows, axis=2)[:,::-1].copy()
+                # results.append(torch.tensor(md, device='cuda' ))
+                # ss = np.nanstd(windows, axis=2)[:,::-1].copy()
+                # results.append(torch.tensor(ss, device='cuda' ))
+
+                del windows
 
                 #TODO: con una sola linea peta
                 for i in range(len(results)):
@@ -120,6 +147,25 @@ class OptiverDataModule(pl.LightningDataModule):
                     # copy is necessary?
                     results[i] = F.avg_pool1d(results[i].unsqueeze(0), kernel_size=kernel_size,
                                               stride=stride).squeeze(0).cpu().numpy().copy()
+                    # #TODO: post-pro
+                    # def caca(a_series):
+
+                    #     peaks = argrelmax(a_series, order=2, axis=0)[0]
+
+                    #     if not 0 in peaks:
+                    #         peaks = np.append(peaks, [0])
+
+                    #     if not (len(a_series)-1) in peaks:
+                    #         peaks = np.append(peaks, [len(a_series)-1])
+
+                    #     try:
+                    #         f = interp1d(peaks, a_series[peaks], kind='cubic')
+                    #     except:
+                    #         return a_series
+
+                    #     return f(range(len(a_series)))
+                    
+                    # results[i] = np.apply_along_axis(caca, 1, results[i])
 
                     assert((~ np.isfinite(results[i])).sum() == 0)
 
@@ -140,12 +186,19 @@ class OptiverDataModule(pl.LightningDataModule):
 
             executed_px = torch.tensor(series[start:end,8], device=device)
             executed_qty = torch.tensor(series[start:end,9], device=device)
-            #order_count = torch.tensor(series[start:end,10], device=device)
-
-            # executed_qty_dist =  reduce(np.divide(executed_qty, sumexecs))
-            # order_count_dist = reduce(np.divide(order_count, np.expand_dims(np.sum(order_count,axis=1),axis=1)))
+            order_count = torch.tensor(series[start:end,10], device=device)
 
             texecqty_mean = torch.tensor(stats[start:end,1], device=device).unsqueeze(1)
+
+            # executed_qty_dist = torch.divide(executed_qty, texecqty_mean)
+            # executed_qty_dist = torch_nan_to_num(executed_qty_dist, posinf=0, neginf=0)
+            #process(executed_qty_dist)
+            
+            # order_count_dist = torch.divide(order_count,torch.sum(order_count,axis=1).unsqueeze(1))
+            # order_count_dist = torch_nan_to_num(order_count_dist, posinf=0, neginf=0)
+            #process(order_count_dist)
+
+            #process(torch.divide(order_count, texecqty_mean))  #WORSE
 
             # Inspired on ...
             def get_liquidityflow(prices, qties, isbuy):
@@ -167,23 +220,32 @@ class OptiverDataModule(pl.LightningDataModule):
                             (price_diff > 0)  * torch.roll(qties, 1, 1)[:,1:] + \
                             (price_diff < 0)  * qties[:,1:]
 
-            # process(get_liquidityflow(bid_px1, bid_qty1 / texecqty_mean, True) + 
-            #         get_liquidityflow(ask_px1, ask_qty1 / texecqty_mean, False) + 
-            #         get_liquidityflow(bid_px2, bid_qty2 / texecqty_mean, True) + 
-            #         get_liquidityflow(ask_px2, ask_qty2 / texecqty_mean, False))
+            # OLI =   get_liquidityflow(bid_px1, bid_qty1 / texecqty_mean, True) + \
+            #         get_liquidityflow(ask_px1, ask_qty1 / texecqty_mean, False) + \
+            #         get_liquidityflow(bid_px2, bid_qty2 / texecqty_mean, True) + \
+            #         get_liquidityflow(ask_px2, ask_qty2 / texecqty_mean, False)
+
+            #process(OLI)
 
             t_bid_size = bid_qty1 + bid_qty2
             t_ask_size = ask_qty1 + ask_qty2
 
-            vol_total_diff = reduce(torch_diff(torch.log(t_bid_size + t_ask_size)))
+            # vol_total_diff = reduce(torch_diff(torch.log(t_bid_size + t_ask_size)))
 
-            vol_unbalance1 = reduce(torch_diff(t_ask_size / ( t_ask_size + t_bid_size + epsilon)))
-            vol_unbalance2 = reduce(torch_diff((ask_qty2 + bid_qty2 - ask_qty1 - bid_qty1) / (texecqty_mean + epsilon)))
-            vol_unbalance3 = reduce(torch_diff((ask_qty1 + bid_qty2 - ask_qty2 - bid_qty1) / (texecqty_mean + epsilon)))
+            # vol_unbalance1 = reduce(torch_diff(t_ask_size / ( t_ask_size + t_bid_size + epsilon)))
+            # vol_unbalance2 = reduce(torch_diff((ask_qty2 + bid_qty2 - ask_qty1 - bid_qty1) / (texecqty_mean + epsilon)))
+            # vol_unbalance3 = reduce(torch_diff((ask_qty1 + bid_qty2 - ask_qty2 - bid_qty1) / (texecqty_mean + epsilon)))
+
+            # # #"some commonly seen technical signals of the financial market are derived from trade data directly, such as high-low or total traded volume." segun organizadores
+            # last_wavg_px = np.nan_to_num(last_wavg_px) + np.isnan(last_wavg_px) * np.nan_to_num(WAP)
+            # # last_log_returns = np.diff(np.log(last_wavg_px), prepend=0)  # TODO: double-check prepend
+            # # log_returns_dev2 = (log_returns + epsilon) / (last_log_returns + epsilon) - 1
+
+            ##########################################################################################################
 
             WAP = (bid_px1*ask_qty1 + ask_px1*bid_qty1) / (bid_qty1 + ask_qty1)
             log_returns = torch_diff(torch.log(WAP))
-            #process(log_returns)  #0.24 0.25 0.25 0.25 0.26
+            process(log_returns)####################
 
             # print()
             # print('Volatility decreases in general:')
@@ -192,6 +254,8 @@ class OptiverDataModule(pl.LightningDataModule):
             # print('drop in the last 30 seconds:', round(torch.mean(torch.std(log_returns[:,-30:], dim=1)*1e3).item(),3))
 
             executed_px = torch_nan_to_num(executed_px) + torch.isnan(executed_px) * torch_nan_to_num(WAP)
+            #executed_px_returns = torch_diff(torch.log(executed_px))
+            #process(executed_px_returns) #NO gran mejoria respecto log_returns, PROBAR en lugar del ratio con WAP?
 
             # past realized volatility
             stats[start:end,2] = torch.sqrt(torch.sum(torch.pow(log_returns,2),dim=1)).cpu().numpy()
@@ -210,31 +274,34 @@ class OptiverDataModule(pl.LightningDataModule):
             w_avg_ask_price = (ask_px1*ask_qty1 + ask_px2*ask_qty2) / t_ask_size
 
             deepWAP = (w_avg_bid_price * t_ask_size + w_avg_ask_price * t_bid_size) / (t_bid_size + t_ask_size)
-            #process(torch_diff(torch.log(deepWAP)) - log_returns)  #no funciona
-            #process(torch_diff(torch.log((bid_px1 + ask_px1) / 2)) - log_returns)  #no funciona
+            #deepWAP_returns = torch_diff(torch.log(deepWAP))
+            #process(deepWAP_returns) #NO gran mejoria respecto log_returns, PROBAR en lugar del ratio con WAP?
 
-            spread = ask_px1 / bid_px1 - 1
-            process(spread)
+            midprice = (bid_px1 + ask_px1) / 2
+            #midprice_returns = torch_diff(torch.log(midprice))
+            #process(midprice_returns) #NO gran mejoria respecto log_returns, PROBAR en lugar del ratio con WAP?
 
-            deep_spread = reduce(w_avg_ask_price / w_avg_bid_price - 1)
-            #TODO: deepWAPs - WAP
-            #TODO: midprice - WAP
+            #spread
+            process(ask_px1 / bid_px1 - 1)####################
+
+            process(deepWAP / WAP - 1)####################
+            process(midprice / WAP - 1)####################
+            process(executed_px / WAP - 1)####################
 
             del bid_px1
             del ask_px1
             del bid_qty1
             del ask_qty1
-
             del bid_px2
             del ask_px2
             del bid_qty2
             del ask_qty2
- 
             del t_bid_size
             del t_ask_size
             del w_avg_bid_price
             del w_avg_ask_price
-            del deepWAP
+            # del deepWAP
+            # del midprice
 
 
             ################################ Inspired on Technical Analysis ################################
@@ -255,19 +322,19 @@ class OptiverDataModule(pl.LightningDataModule):
 
             # # Inspired on https://www.investopedia.com/terms/m/mfi.asp
             
-            # money_flow = (executed_px * executed_qty)[:,1:]
+            money_flow = (executed_px * executed_qty)[:,1:]
 
             # money_flow_pos = money_flow * (torch_diff(executed_px) > 0)
             # money_flow_neg = money_flow * (torch_diff(executed_px) < 0)
 
-            # money_flow_pos_windows = money_flow_pos.unfold(1,m_kernel_sizes[1],1)
-            # money_flow_neg_windows = money_flow_neg.unfold(1,m_kernel_sizes[1],1)
+            # money_flow_pos_windows = money_flow_pos.unfold(1,mks,1)
+            # money_flow_neg_windows = money_flow_neg.unfold(1,mks,1)
 
             # money_flow_pos_sums = torch.nansum(money_flow_pos_windows, axis=2)
             # money_flow_neg_sums = torch.nansum(money_flow_neg_windows, axis=2)
 
             # MFI = money_flow_pos_sums / (money_flow_pos_sums + money_flow_neg_sums)
-            # MFI = reduce(torch_nan_to_num(MFI,nan=0.5))
+            # process(torch_nan_to_num(MFI,nan=0.5))
 
             # del money_flow_pos
             # del money_flow_neg
@@ -275,99 +342,57 @@ class OptiverDataModule(pl.LightningDataModule):
             # del money_flow_neg_windows
             # del money_flow_pos_sums
             # del money_flow_neg_sums
+            # #del MFI
 
 
             # # Inspired on https://www.investopedia.com/terms/v/vwap.asp
 
-            # money_flows_windows = money_flow.unfold(1,m_kernel_sizes[1],1)
-            # executed_qty_windows = executed_qty[:,1:].unfold(1,m_kernel_sizes[1],1)
+            money_flows_windows = money_flow.unfold(1,mks,1)
+            executed_qty_windows = executed_qty[:,1:].unfold(1,mks,1)
 
-            # VWAP = torch.sum(money_flows_windows, axis=2) / torch.sum(executed_qty_windows, axis=2)
-            # VWAP = torch.tensor(pd.DataFrame(VWAP.cpu().numpy()).ffill(axis=1).values, device=device)
-            # VWAP = torch_nan_to_num(VWAP) + torch.isnan(VWAP) * torch_nan_to_num(WAP[:,:VWAP.shape[1]])  # beginning of series
-            # VWAP_returns = reduce(torch_diff(torch.log(VWAP)))
+            VWAP = torch.sum(money_flows_windows, axis=2) / torch.sum(executed_qty_windows, axis=2)
+            VWAP = torch.tensor(pd.DataFrame(VWAP.cpu().numpy()).ffill(axis=1).values, device=device)
+            VWAP = torch_nan_to_num(VWAP) + torch.isnan(VWAP) * torch_nan_to_num(WAP[:,-VWAP.shape[1]:])  # beginning of series
+            
+            VWAP_returns = torch_diff(torch.log(VWAP))
+            process(VWAP_returns)####################
+            process(VWAP / WAP[:,-VWAP.shape[1]:] - 1)####################
 
-            # del money_flows_windows
-            # del executed_qty_windows
+            del money_flow
+            del money_flows_windows
+            del executed_qty_windows
+            #del WAP
 
 
             # ####
 
-            # moving_stds  = []
-            # moving_means = []
-            # moving_mins  = []
-            # moving_maxs  = []
+            #TODO: lo mismo con VWAP
+            #TODO: lo mismo con log_returns, deepWAP_returns y midprice_returns? lo mismo con otros precios??
+            WAP_windows = WAP.unfold(1,mks,1)
 
-            # #TODO: lo mismo con deepWAP_returns y midprice_returns?
-            # for mks in m_kernel_sizes:
+            WAP_rolling_mean = torch.mean(WAP_windows, axis=2)
+            WAP_rolling_std  = torch.std(WAP_windows, axis=2)
+            WAP_rolling_max  = torch.max(WAP_windows, axis=2).values
+            WAP_rolling_min  = torch.min(WAP_windows, axis=2).values
 
-            #     WAP_windows = log_returns.unfold(1,mks,1)
+            del WAP_windows
 
-            #     std = torch.std(WAP_windows, axis=2)
-
-            #     moving_stds.append(reduce(std))
-
-            #     moving_means.append(reduce(torch.mean(WAP_windows, axis=2)))
-            #     moving_mins.append(reduce(torch.min(WAP_windows, axis=2).values))
-            #     moving_maxs.append(reduce(torch.max(WAP_windows, axis=2).values))
-
-            #     del WAP_windows
-
-            #moving_stds 2nd level
+            # moving_stds 2nd level
             # moving_std_windows = moving_stds[2].unfold(1,60,1)
-
             # moving_std_mean = reduce(torch.mean(moving_std_windows, axis=2))
             # moving_std_std = reduce(torch.std(moving_std_windows, axis=2))
-
             # del moving_std_windows
 
+            # ####
 
 
             # # Inspired on https://www.investopedia.com/terms/u/.....
 
-            # bollinger_deviation = reduce(((moving_mean - WAP[:,-moving_mean.shape[1]:]) / (moving_stds[1] + epsilon)))  #TODO moving_stds[1]==0 case
+            bollinger_deviation = (WAP_rolling_mean - WAP[:,-WAP_rolling_mean.shape[1]:]) / (WAP_rolling_std + epsilon)
+            get_signals(bollinger_deviation)
 
             # del moving_mean
 
-            # moving_stds_diff = [None] * 3
-
-            # moving_stds_diff[0] = torch_diff(moving_stds[0])
-            # moving_stds_diff[1] = torch_diff(moving_stds[1])
-            # moving_stds_diff[2] = torch_diff(moving_stds[2])
-
-            # #moving_stds 2nd level
-            # moving_std_diff_windows = moving_stds_diff[2].unfold(1,60,1)
-
-            # moving_std_diff_mean = reduce(torch.mean(moving_std_diff_windows, axis=2))
-            # moving_std_diff_std = reduce(torch.std(moving_std_diff_windows, axis=2))
-
-            # del moving_std_diff_windows
-
-
-            # moving_stds[0] = reduce(moving_stds[0])
-            # moving_stds[1] = reduce(moving_stds[1])
-            # moving_stds[2] = reduce(moving_stds[2])
-
-            # moving_stds_diff[0] = reduce(moving_stds_diff[0])
-            # moving_stds_diff[1] = reduce(moving_stds_diff[1])
-            # moving_stds_diff[2] = reduce(moving_stds_diff[2])
-
-
-            # ####
-
-            # moving_std_VWAPs = []
-
-            # for mks in m_kernel_sizes:
-
-            #     VWAP_windows = VWAP.unfold(1,mks,1)
-
-            #     moving_std_VWAPs.append(reduce(torch.std(VWAP_windows, axis=2)))
-
-            #     del VWAP_windows
-
-            # del VWAP
-
-            # ####
 
             # # Inspired on https://www.investopedia.com/terms/u/ulcerindex.asp
             # R = reduce(torch.pow(100 * (WAP[:,-moving_max.shape[1]:] - moving_max) / moving_max, 2))
@@ -376,8 +401,9 @@ class OptiverDataModule(pl.LightningDataModule):
             # CLV = torch_nan_to_num(((executed_px[:,-moving_min.shape[1]:] - moving_min) - (moving_max - executed_px[:,-moving_max.shape[1]:])) /       \
             #                 (moving_max - moving_min), nan=0., posinf=0, neginf=0)
 
-            # # Inspired on ......
-            # ATR = reduce(moving_max / moving_min - 1)
+            # Inspired on ......
+            #ATR
+            process(WAP_rolling_max / WAP_rolling_min - 1)####################
 
             # # Inspired on ......
             # middle_channel = (moving_max + moving_min) / 2
@@ -402,16 +428,9 @@ class OptiverDataModule(pl.LightningDataModule):
             # CLV = reduce(CLV)
             # CMF = reduce(CMF)
 
-            log_returns = reduce(log_returns)
-
             del executed_px
-            del WAP#TODO: antes?
+            del WAP #TODO: antes?
 
-            # # #"some commonly seen technical signals of the financial market are derived from trade data directly, such as high-low or total traded volume." segun organizadores
-
-            # last_wavg_px = np.nan_to_num(last_wavg_px) + np.isnan(last_wavg_px) * np.nan_to_num(WAP)
-            # # last_log_returns = np.diff(np.log(last_wavg_px), prepend=0)  # TODO: double-check prepend
-            # # log_returns_dev2 = (log_returns + epsilon) / (last_log_returns + epsilon) - 1
 
             s_lengths = []
 
@@ -424,13 +443,13 @@ class OptiverDataModule(pl.LightningDataModule):
             processed.append(np.stack(batch, axis=1))
 
             gc.collect()
+            torch.cuda.empty_cache()
 
         series = np.vstack(processed)
         gc.collect()
-        torch.cuda.empty_cache()
 
         print('min:',list(np.round(np.min(series,axis=(0,2)),5)))
-        print('med:',list(np.round(np.median(series,axis=(0,2)),5)))
+        #print('med:',list(np.round(np.median(series,axis=(0,2)),5)))
         print('max:',list(np.round(np.max(series,axis=(0,2)),5)))
 
         if scale and len(series) > 1:
@@ -489,27 +508,27 @@ class OptiverDataModule(pl.LightningDataModule):
         stats_h = []
         r = series.shape[2]
 
-        ds = [1, 2, 4]
-        for d in ds:
+        # ds = [1, 2, 4]
+        # for d in ds:
 
-            s = series[:,:,-r//d:]
+        #     s = series[:,:,-r//d:]
 
-            stats_h.append(np.hstack((
+        #     stats_h.append(np.hstack((
 
-                np.mean(s,axis=2),
-                np.std(s,axis=2),
-                np.max(s,axis=2) - np.min(s,axis=2),
-                np.max(np.abs(s),axis=2)
+        #         np.mean(s,axis=2),
+        #         np.std(s,axis=2),
+        #         np.max(s,axis=2) - np.min(s,axis=2),
+        #         np.max(np.abs(s),axis=2)
                     
-             )))
+        #      )))
 
-            corrs = np.corrcoef(np.hstack((stats_h[-1], np.expand_dims(targets[:,-1],1))).T)[:-1,-1]
-            print('corrs for last {} ticks:'.format(r//d), np.round(corrs,2))
+        #     corrs = np.corrcoef(np.hstack((stats_h[-1], np.expand_dims(targets[:,-1],1))).T)[:-1,-1]
+        #     print('corrs for last {} ticks:'.format(r//d), np.round(corrs,2))
 
-        # corrs = np.corrcoef(np.hstack((stats_h[2]-stats_h[1], np.expand_dims(targets[:,-1],1))).T)[:-1,-1]
-        # print('corrs for {} t - {} t:'.format(r//ds[2], r//ds[1]), np.round(corrs,2))
-        corrs = np.corrcoef(np.hstack((stats_h[2]-stats_h[0], np.expand_dims(targets[:,-1],1))).T)[:-1,-1]
-        print('corrs for {} t - {} t:'.format(r//ds[2], r//ds[0]), np.round(corrs,2))
+        # # corrs = np.corrcoef(np.hstack((stats_h[2]-stats_h[1], np.expand_dims(targets[:,-1],1))).T)[:-1,-1]
+        # # print('corrs for {} t - {} t:'.format(r//ds[2], r//ds[1]), np.round(corrs,2))
+        # corrs = np.corrcoef(np.hstack((stats_h[2]-stats_h[0], np.expand_dims(targets[:,-1],1))).T)[:-1,-1]
+        # print('corrs for {} t - {} t:'.format(r//ds[2], r//ds[0]), np.round(corrs,2))
 
         stats_h.append(stats)
         stats = np.hstack(stats_h)
@@ -518,7 +537,7 @@ class OptiverDataModule(pl.LightningDataModule):
         print('abs corrs sorted:')
         print(np.round(np.sort(np.abs(corrs))[::-1],2))
 
-        THRESHOLD = 0.1
+        THRESHOLD = 0.
         stats = stats[:,np.abs(corrs)>THRESHOLD]  #TODO
         print('final shape',stats.shape)
 
@@ -549,13 +568,13 @@ class OptiverDataModule(pl.LightningDataModule):
     def train_dataloader(self):
 
         #TODO: sorting por volatilidad
-        idx = self.targets[:,0] % 5 == self.CV_split
-        return DataLoader(SeriesDataSet(self.series[idx], self.series_medians[idx], self.stats[idx], self.targets[idx]), batch_size=512, shuffle=True)
+        idx = self.targets[:,0] % 5 != self.CV_split
+        return DataLoader(SeriesDataSet(self.series[idx], self.stats[idx], self.targets[idx]), batch_size=512, shuffle=True)
 
     def val_dataloader(self):
 
         idx = self.targets[:,0] % 5 == self.CV_split
-        return DataLoader(SeriesDataSet(self.series[idx], self.series_medians[idx], self.stats[idx], self.targets[idx]), batch_size=44039, shuffle=False)
+        return DataLoader(SeriesDataSet(self.series[idx], self.stats[idx], self.targets[idx]), batch_size=44039, shuffle=False)
 
 
 
@@ -654,12 +673,11 @@ def get_time_series(settings):
 
 class SeriesDataSet(Dataset):
     
-    def __init__(self, series, series_medians, stats, targets):
+    def __init__(self, series, stats, targets):
 
         super(SeriesDataSet, self).__init__()
 
         self.series = series
-        self.series_medians = series_medians
         self.stats = stats
         self.targets = targets
 
@@ -669,7 +687,7 @@ class SeriesDataSet(Dataset):
 
     def __getitem__(self, idx):
 
-        return self.series[idx], self.series_medians[idx], self.stats[idx], self.targets[idx]
+        return self.series[idx], self.stats[idx], self.targets[idx]
 
 
 if __name__ == '__main__':

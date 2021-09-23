@@ -20,8 +20,8 @@ def fit_model(CV_split):
 
     data = OptiverDataModule(CV_split=CV_split)
 
-    # model = PatternFinder(in_channels=data.series.shape[1])
-    model = VolatilityClassifier(data.stats.shape[1])
+    model = PatternFinder(in_channels=data.series.shape[1], series_medians=data.series_medians)
+    #model = VolatilityClassifier(data.stats.shape[1])
     # model = ResNet1D(
     #                     in_channels=15, 
     #                     base_filters=15, 
@@ -38,7 +38,7 @@ def fit_model(CV_split):
     dirpath='./checkpoints/'
 
     early_stop_callback = EarlyStopping(
-        monitor='val_mae',
+        monitor='val_rmspe',
         patience=12,
         verbose=True,
         mode='min'
@@ -49,7 +49,7 @@ def fit_model(CV_split):
         filename=filename,
         save_top_k=1,
         verbose=True,
-        monitor='val_mae',
+        monitor='val_rmspe',
         mode='min'
     )
 

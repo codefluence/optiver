@@ -1,24 +1,11 @@
-                # log_returns[:,horizon:],
 
                 #np.cumsum(np.diff(moving_stds[2], n=60, axis=1), axis=1),#[:,horizon:],
 
-                # moving_stds[0][:,horizon:],
-                # moving_stds[1][:,horizon:],
-                # moving_stds[2][:,horizon:],
-
-                ######
-
-                # moving_means[0][:,horizon:],
-
                 # moving_realized_vols[0][:,horizon:],
+                # realized_vol[:,-nels:],    # 0.31 <----------------------
 
                 # moving_std_mean[:,horizon:],
                 # moving_std_std[:,horizon:],
-                # moving_stds_diff[0][:,horizon:],
-                # moving_stds_diff[1][:,horizon:],
-                # moving_stds_diff[2][:,horizon:],
-                # moving_std_diff_mean[:,horizon:],
-                # moving_std_diff_std[:,horizon:],
 
                 # # Volume / liquidity (0.45)
                 # moving_OLIs[0][:,horizon:],
@@ -27,28 +14,8 @@
                 # vol_unbalance2[:,-nels:],
                 # vol_unbalance3[:,-nels:],
 
-                # # Returns (0.26)
-                # log_returns[:,-nels:],    # 0.286 <----------------------
-                # deepWAP_returns[:,-nels:],    
-                # executed_px_returns[:,-nels:],    # 0.48
-                # mid_price_returns[:,-nels:],    # 0.46
-                # VWAP_returns[:,horizon:],    # 0.38 <----------------------
-
-                # # Volatility (0.27)
-                # moving_stds[0][:,-nels:] - moving_stds[1][:,-nels:],
-                # moving_stds[1][:,-nels:] - moving_stds[2][:,-nels:],
-                # moving_std_VWAPs[0][:,-nels:] - moving_std_VWAPs[1][:,-nels:],
-                # moving_std_VWAPs[1][:,-nels:] - moving_std_VWAPs[2][:,-nels:],
-                # moving_std_VWAPs[0][:,-nels:],
-                # moving_std_VWAPs[1][:,-nels:],
-                # moving_std_VWAPs[2][:,-nels:],
-                # realized_vol[:,-nels:],    # 0.31 <----------------------
-
-                # # Spreads (0.26)
-                # # spread[:,-nels:],    # 0.4 <----------------------
                 # ATR[:,horizon:],   # 0.29 <----------------------
                 # # R[:,-nels:],   # 0.38 <----------------------
-
                 # OBV[:,horizon:],   # 0.54
                 # #force_index[:,-nels:],   # 0.51
                 # MFI[:,horizon:],   # 0.53
