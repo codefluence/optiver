@@ -4,9 +4,6 @@
                 # moving_realized_vols[0][:,horizon:],
                 # realized_vol[:,-nels:],    # 0.31 <----------------------
 
-                # moving_std_mean[:,horizon:],
-                # moving_std_std[:,horizon:],
-
                 # # Volume / liquidity (0.45)
                 # moving_OLIs[0][:,horizon:],
                 # vol_total_diff[:,-nels:],

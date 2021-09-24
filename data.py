@@ -31,7 +31,7 @@ pd.set_option('display.max_rows', 600)
 class OptiverDataModule(pl.LightningDataModule):
 
     def __init__(self, settings_path='./settings.json', device='cuda', batch_size=50000, scale=True,
-                 kernel_size=5, stride=5, mks=30, CV_split=0):
+                 kernel_size=5, stride=5, mks=30, CV_split=0, end_clip=30):
 
         super(OptiverDataModule, self).__init__()
 
@@ -73,26 +73,34 @@ class OptiverDataModule(pl.LightningDataModule):
 
 
 
-        # series  = series[:100000]
-        # targets = targets[:100000]
+        series  = series[::2]
+        targets = targets[::2]
+
+
+
+        signals = np.empty((len(series),2), dtype=np.float32)
+        signals[:] = np.nan
 
 
 
         print('computing stock stats...')
 
-        stats = np.empty((len(series),3), dtype=np.float32)
+        stats = np.empty((len(series),2), dtype=np.float32)
         stats[:] = np.nan
 
         # sum of executed_qty for each data point
-        stats[:,0] = np.sum(series[:,9], axis=1)  
+        stats[:,0] = np.sum(series[:,9], axis=1)
+
+        texecqty_mean_all = np.empty((len(series)), dtype=np.float32)
+        texecqty_mean_all[:] = np.nan
 
         # for each stock id, the mean of the sum of executed_qty is computed
         # this number tells abouts the usual volume of each stock
         for i in np.unique(targets[:,0]):
             idx = targets[:,0] == int(i)
-            stats[idx,1] = np.mean(stats[idx,0])
+            texecqty_mean_all[idx] = np.mean(stats[idx,0])
 
-
+        stats[:,0] = stats[:,0] / texecqty_mean_all
 
         print('processing series...')
 
@@ -104,42 +112,40 @@ class OptiverDataModule(pl.LightningDataModule):
 
             batch = []
 
-            def get_signals(array, upper_th, lower_th):
+            start = bidx*batch_size
+            end   = start + min(batch_size, len(series) - start)
 
-                
-                pass
+            def process(raw, toinclude):
 
-            def process(array):
+                windows = raw.unfold(1,mks,1)
 
-                #######################################
-                batch.extend(F.avg_pool1d(array.unsqueeze(0), kernel_size=kernel_size, stride=stride).squeeze(0).cpu().numpy().copy())
-                return#######################################
-
-
-                results = []
-                results.append(array)
-
-                #TODO: torch.cumsum(array, dim=1)
-                windows = array.unfold(1,mks,1)
-
-                results.append(torch.mean(windows, dim=2))
-                results.append(torch.std(windows, dim=2))
-                results.append(torch.max(windows, dim=2)[0] - torch.min(windows, dim=2)[0])
-                #results.append(torch.max(torch.abs(windows), dim=2)[0])
-                results.append(torch.max(windows, dim=2)[0])
-
-                # empty = torch.zeros((array.shape[0],array.shape[1]-1), device='cuda')
-                # empty[:] = np.nan
-                # reversedextended = torch.flip(torch.hstack((array,empty)),dims=(1,))
-                # windows = reversedextended.unfold(1,array.shape[1],1).cpu().numpy()
-                # torch.cuda.empty_cache()
-
-                # md = np.nanmean(windows, axis=2)[:,::-1].copy()
-                # results.append(torch.tensor(md, device='cuda' ))
-                # ss = np.nanstd(windows, axis=2)[:,::-1].copy()
-                # results.append(torch.tensor(ss, device='cuda' ))
+                rolling_mean = torch.mean(windows, dim=2)
+                rolling_std  = torch.std(windows, dim=2)
+                rolling_max  = torch.max(windows, dim=2)[0]
+                rolling_min  = torch.min(windows, dim=2)[0]
 
                 del windows
+
+                results = []
+
+                if 0 in toinclude: results.append(raw)
+                if 1 in toinclude: results.append(rolling_mean)
+                if 2 in toinclude: results.append(rolling_std)#TODO: nans?
+                if 3 in toinclude: results.append(rolling_max)
+                if 4 in toinclude: results.append(rolling_min)
+
+                if 5 in toinclude:
+                    rolling_deviation = (raw[:,-rolling_mean.shape[1]:] - rolling_mean) / rolling_std
+                    results.append(torch_nan_to_num(rolling_deviation, nan=0, posinf=0, neginf=0))
+
+                if 6 in toinclude:
+                    rolling_minmaxspread = rolling_max / rolling_min -1
+                    results.append(torch_nan_to_num(rolling_minmaxspread, nan=0, posinf=0, neginf=0))
+
+                if 7 in toinclude:
+                    h = rolling_deviation.shape[1] // 2
+                    signals[start:end,0] = ((torch.sum((rolling_deviation[:,:h] > 5) | (rolling_deviation[:,:h] < -5),dim=1)>0)*1).cpu().numpy()
+                    signals[start:end,1] = ((torch.sum((rolling_deviation[:,-h:] > 5) | (rolling_deviation[:,-h:] < -5),dim=1)>0)*1).cpu().numpy()
 
                 #TODO: con una sola linea peta
                 for i in range(len(results)):
@@ -147,32 +153,10 @@ class OptiverDataModule(pl.LightningDataModule):
                     # copy is necessary?
                     results[i] = F.avg_pool1d(results[i].unsqueeze(0), kernel_size=kernel_size,
                                               stride=stride).squeeze(0).cpu().numpy().copy()
-                    # #TODO: post-pro
-                    # def caca(a_series):
 
-                    #     peaks = argrelmax(a_series, order=2, axis=0)[0]
-
-                    #     if not 0 in peaks:
-                    #         peaks = np.append(peaks, [0])
-
-                    #     if not (len(a_series)-1) in peaks:
-                    #         peaks = np.append(peaks, [len(a_series)-1])
-
-                    #     try:
-                    #         f = interp1d(peaks, a_series[peaks], kind='cubic')
-                    #     except:
-                    #         return a_series
-
-                    #     return f(range(len(a_series)))
-                    
-                    # results[i] = np.apply_along_axis(caca, 1, results[i])
-
-                    assert((~ np.isfinite(results[i])).sum() == 0)
+                    assert((~np.isfinite(results[i])).sum() == 0)
 
                 batch.extend(results)
-
-            start = bidx*batch_size
-            end   = start + min(batch_size, len(series) - start)
 
             bid_px1 = torch.tensor(series[start:end,0], device=device)
             ask_px1 = torch.tensor(series[start:end,1], device=device)
@@ -188,7 +172,7 @@ class OptiverDataModule(pl.LightningDataModule):
             executed_qty = torch.tensor(series[start:end,9], device=device)
             order_count = torch.tensor(series[start:end,10], device=device)
 
-            texecqty_mean = torch.tensor(stats[start:end,1], device=device).unsqueeze(1)
+            texecqty_mean = torch.tensor(texecqty_mean_all[start:end], device=device).unsqueeze(1)
 
             # executed_qty_dist = torch.divide(executed_qty, texecqty_mean)
             # executed_qty_dist = torch_nan_to_num(executed_qty_dist, posinf=0, neginf=0)
@@ -244,8 +228,19 @@ class OptiverDataModule(pl.LightningDataModule):
             ##########################################################################################################
 
             WAP = (bid_px1*ask_qty1 + ask_px1*bid_qty1) / (bid_qty1 + ask_qty1)
+            process(WAP,[0,2,5,6,7])####################
+            ########################## BAJO CONTROL #############################
+            # # Inspired on https://www.investopedia.com/terms/u/.....
+            # bollinger_deviation = (WAP_rolling_mean - WAP[:,-WAP_rolling_mean.shape[1]:]) > (WAP_rolling_std + epsilon)*2
+            # process(bollinger_deviation,start,end)
+            # del moving_mean
+            ########################## BAJO CONTROL #############################
+            # Inspired on ......
+            #ATR
+            #process(WAP_rolling_max / WAP_rolling_min - 1)####################
+
             log_returns = torch_diff(torch.log(WAP))
-            process(log_returns)####################
+            process(log_returns,[0,2,3,5])#################### 0y1, 3y6 redundantes?
 
             # print()
             # print('Volatility decreases in general:')
@@ -258,7 +253,7 @@ class OptiverDataModule(pl.LightningDataModule):
             #process(executed_px_returns) #NO gran mejoria respecto log_returns, PROBAR en lugar del ratio con WAP?
 
             # past realized volatility
-            stats[start:end,2] = torch.sqrt(torch.sum(torch.pow(log_returns,2),dim=1)).cpu().numpy()
+            stats[start:end,1] = torch.sqrt(torch.sum(torch.pow(log_returns,2),dim=1)).cpu().numpy()
 
             # moving_realized_vols = []
 
@@ -282,11 +277,12 @@ class OptiverDataModule(pl.LightningDataModule):
             #process(midprice_returns) #NO gran mejoria respecto log_returns, PROBAR en lugar del ratio con WAP?
 
             #spread
-            process(ask_px1 / bid_px1 - 1)####################
+            process(ask_px1 / bid_px1 - 1,[0])####################
 
-            process(deepWAP / WAP - 1)####################
-            process(midprice / WAP - 1)####################
-            process(executed_px / WAP - 1)####################
+            #price dev
+            process(deepWAP / WAP - 1,[0])####################
+            process(midprice / WAP - 1,[0])####################
+            process(executed_px / WAP - 1,[0])####################
 
             del bid_px1
             del ask_px1
@@ -353,10 +349,11 @@ class OptiverDataModule(pl.LightningDataModule):
             VWAP = torch.sum(money_flows_windows, axis=2) / torch.sum(executed_qty_windows, axis=2)
             VWAP = torch.tensor(pd.DataFrame(VWAP.cpu().numpy()).ffill(axis=1).values, device=device)
             VWAP = torch_nan_to_num(VWAP) + torch.isnan(VWAP) * torch_nan_to_num(WAP[:,-VWAP.shape[1]:])  # beginning of series
-            
+            process(WAP,[0,2,5,6])###################
+
             VWAP_returns = torch_diff(torch.log(VWAP))
-            process(VWAP_returns)####################
-            process(VWAP / WAP[:,-VWAP.shape[1]:] - 1)####################
+            process(VWAP_returns,[0,2,3,5])####################
+            #process(VWAP / WAP[:,-VWAP.shape[1]:] - 1)####################
 
             del money_flow
             del money_flows_windows
@@ -364,7 +361,8 @@ class OptiverDataModule(pl.LightningDataModule):
             #del WAP
 
 
-            # ####
+            # ################################################################################################################################
+
 
             #TODO: lo mismo con VWAP
             #TODO: lo mismo con log_returns, deepWAP_returns y midprice_returns? lo mismo con otros precios??
@@ -375,44 +373,29 @@ class OptiverDataModule(pl.LightningDataModule):
             WAP_rolling_max  = torch.max(WAP_windows, axis=2).values
             WAP_rolling_min  = torch.min(WAP_windows, axis=2).values
 
-            del WAP_windows
+            process(WAP_rolling_std,[1,3,5])  #TODO: 3 y 5 son utiles?
 
-            # moving_stds 2nd level
-            # moving_std_windows = moving_stds[2].unfold(1,60,1)
-            # moving_std_mean = reduce(torch.mean(moving_std_windows, axis=2))
-            # moving_std_std = reduce(torch.std(moving_std_windows, axis=2))
-            # del moving_std_windows
+            del WAP_windows
 
             # ####
 
-
-            # # Inspired on https://www.investopedia.com/terms/u/.....
-
-            bollinger_deviation = (WAP_rolling_mean - WAP[:,-WAP_rolling_mean.shape[1]:]) / (WAP_rolling_std + epsilon)
-            get_signals(bollinger_deviation)
-
-            # del moving_mean
-
-
             # # Inspired on https://www.investopedia.com/terms/u/ulcerindex.asp
-            # R = reduce(torch.pow(100 * (WAP[:,-moving_max.shape[1]:] - moving_max) / moving_max, 2))
+            R = torch.pow(100 * (WAP[:,-WAP_rolling_max.shape[1]:] - WAP_rolling_max) / WAP_rolling_max, 2)
+            process(R,[0])
 
             # # Inspired on https://www.investopedia.com/articles/trading/08/accumulation-distribution-line.asp
-            # CLV = torch_nan_to_num(((executed_px[:,-moving_min.shape[1]:] - moving_min) - (moving_max - executed_px[:,-moving_max.shape[1]:])) /       \
-            #                 (moving_max - moving_min), nan=0., posinf=0, neginf=0)
-
-            # Inspired on ......
-            #ATR
-            process(WAP_rolling_max / WAP_rolling_min - 1)####################
+            # CLV = ((executed_px[:,-WAP_rolling_min.shape[1]:] - WAP_rolling_min) - (WAP_rolling_max - executed_px[:,-WAP_rolling_max.shape[1]:])) /   \
+            #                  (WAP_rolling_max - WAP_rolling_min)
+            # process(torch_nan_to_num(CLV, nan=0, posinf=0, neginf=0),[0])
 
             # # Inspired on ......
-            # middle_channel = (moving_max + moving_min) / 2
-            # donchian_deviation = reduce((middle_channel - WAP[:,-middle_channel.shape[1]:]) / (moving_max - moving_min + epsilon))  #TODO
+            middle_channel = (WAP_rolling_max + WAP_rolling_min) / 2
+            donchian_deviation = (middle_channel - WAP[:,-middle_channel.shape[1]:]) / (WAP_rolling_max - WAP_rolling_min)  #TODO
+            process(torch_nan_to_num(donchian_deviation, nan=0, posinf=0, neginf=0),[0])
 
-            # del middle_channel
-            # del moving_min
-            # del moving_max
-
+            del middle_channel
+            del WAP_rolling_min
+            del WAP_rolling_max
 
             # # Inspired on https://www.investopedia.com/terms/c/chaikinoscillator.asp
             # lexqty = executed_qty[:,-CLV.shape[1]:]
@@ -432,13 +415,13 @@ class OptiverDataModule(pl.LightningDataModule):
             del WAP #TODO: antes?
 
 
-            s_lengths = []
+            s_lengths = [102 + end_clip//stride]#TODO
 
             for s in batch:
                 s_lengths.append(s.shape[1])
 
             for i in range(len(batch)):
-                batch[i] = batch[i][:,-min(s_lengths):-30//stride]  #TODO
+                batch[i] = batch[i][:,-min(s_lengths):-end_clip//stride]  #TODO
 
             processed.append(np.stack(batch, axis=1))
 
@@ -474,10 +457,12 @@ class OptiverDataModule(pl.LightningDataModule):
         #     scaler = MinMaxScaler().fit(series[:,i].T)
         #     series[:,i] = scaler.transform(series[:,i].T).T
 
-        series_medians = np.median(series, axis=0)
+        series_medians = series_means#TODO:np.median(series, axis=0)
 
         assert((~np.isfinite(series)).sum() == 0)
         assert((~np.isfinite(series_medians)).sum() == 0)
+
+        print('series shape:',series.shape)
 
         self.series = series
         self.series_medians = series_medians
@@ -487,7 +472,7 @@ class OptiverDataModule(pl.LightningDataModule):
         print('computing targets...')
 
         fut_rea_vol = targets[:,3]
-        past_rea_vol = stats[:,2]
+        past_rea_vol = stats[:,1]
         rea_vol_delta = fut_rea_vol - past_rea_vol
         rea_vol_increase = fut_rea_vol / past_rea_vol - 1
 
@@ -506,8 +491,8 @@ class OptiverDataModule(pl.LightningDataModule):
         print('computing series stats...')
 
         stats_h = []
-        r = series.shape[2]
 
+        # r = series.shape[2]
         # ds = [1, 2, 4]
         # for d in ds:
 
@@ -517,8 +502,8 @@ class OptiverDataModule(pl.LightningDataModule):
 
         #         np.mean(s,axis=2),
         #         np.std(s,axis=2),
-        #         np.max(s,axis=2) - np.min(s,axis=2),
-        #         np.max(np.abs(s),axis=2)
+        #         np.max(s,axis=2),
+        #         np.min(s,axis=2)
                     
         #      )))
 
@@ -531,6 +516,7 @@ class OptiverDataModule(pl.LightningDataModule):
         # print('corrs for {} t - {} t:'.format(r//ds[2], r//ds[0]), np.round(corrs,2))
 
         stats_h.append(stats)
+        stats_h.append(signals)#######################
         stats = np.hstack(stats_h)
 
         corrs = np.corrcoef(np.hstack((stats, np.expand_dims(targets[:,-1],1))).T)[:-1,-1]
@@ -539,7 +525,7 @@ class OptiverDataModule(pl.LightningDataModule):
 
         THRESHOLD = 0.
         stats = stats[:,np.abs(corrs)>THRESHOLD]  #TODO
-        print('final shape',stats.shape)
+        print('stats shape',stats.shape)
 
         if scale and len(stats) > 1:
 
@@ -569,7 +555,7 @@ class OptiverDataModule(pl.LightningDataModule):
 
         #TODO: sorting por volatilidad
         idx = self.targets[:,0] % 5 != self.CV_split
-        return DataLoader(SeriesDataSet(self.series[idx], self.stats[idx], self.targets[idx]), batch_size=512, shuffle=True)
+        return DataLoader(SeriesDataSet(self.series[idx], self.stats[idx], self.targets[idx]), batch_size=4096, shuffle=True)
 
     def val_dataloader(self):
 
@@ -688,6 +674,51 @@ class SeriesDataSet(Dataset):
     def __getitem__(self, idx):
 
         return self.series[idx], self.stats[idx], self.targets[idx]
+
+                # def get_extrema(array):
+                #     #TODO: assert((~ torch.isfinite(array)).sum() == 0)
+                #     h = array.shape[1]
+
+                #     batch2.append(F.max_pool1d(array[:,:h//2].unsqueeze(0), array[:,:h//2].shape[1], 1).squeeze(0).cpu().numpy().copy())
+                #     batch2.append(F.max_pool1d(array[:,h//2:-h//4].unsqueeze(0), array[:,h//2:-h//4].shape[1], 1).squeeze(0).cpu().numpy().copy())
+                #     batch2.append(F.max_pool1d(array[:,-h//4:].unsqueeze(0), array[:,-h//4:].shape[1], 1).squeeze(0).cpu().numpy().copy())
+
+                #     batch2.append(F.max_pool1d(-1*array[:,:h//2].unsqueeze(0), array[:,:h//2].shape[1], 1).squeeze(0).cpu().numpy().copy())
+                #     batch2.append(F.max_pool1d(-1*array[:,h//2:-h//4].unsqueeze(0), array[:,h//2:-h//4].shape[1], 1).squeeze(0).cpu().numpy().copy())
+                #     batch2.append(F.max_pool1d(-1*array[:,-h//4:].unsqueeze(0), array[:,-h//4:].shape[1], 1).squeeze(0).cpu().numpy().copy())
+
+                # empty = torch.zeros((raw.shape[0],raw.shape[1]-1), device='cuda')
+                # empty[:] = np.nan
+                # reversedextended = torch.flip(torch.hstack((raw,empty)),dims=(1,))
+                # windows = reversedextended.unfold(1,raw.shape[1],1).cpu().numpy()
+                # torch.cuda.empty_cache()
+
+                # md = np.nanmean(windows, axis=2)[:,::-1].copy()
+                # results.append(torch.tensor(md, device='cuda' ))
+                # ss = np.nanstd(windows, axis=2)[:,::-1].copy()
+                # results.append(torch.tensor(ss, device='cuda' ))
+
+
+                    # #TODO: post-pro
+                    # def caca(a_series):
+
+                    #     peaks = argrelmax(a_series, order=2, axis=0)[0]
+
+                    #     if not 0 in peaks:
+                    #         peaks = np.append(peaks, [0])
+
+                    #     if not (len(a_series)-1) in peaks:
+                    #         peaks = np.append(peaks, [len(a_series)-1])
+
+                    #     try:
+                    #         f = interp1d(peaks, a_series[peaks], kind='cubic')
+                    #     except:
+                    #         return a_series
+
+                    #     return f(range(len(a_series)))
+                    
+                    # results[i] = np.apply_along_axis(caca, 1, results[i])
+
 
 
 if __name__ == '__main__':

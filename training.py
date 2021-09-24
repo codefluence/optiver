@@ -20,7 +20,10 @@ def fit_model(CV_split):
 
     data = OptiverDataModule(CV_split=CV_split)
 
-    model = PatternFinder(in_channels=data.series.shape[1], series_medians=data.series_medians)
+    model = PatternFinder(  in_channels=data.series.shape[1],
+                            stats_num=data.stats.shape[1],
+                            series_medians=data.series_medians)
+
     #model = VolatilityClassifier(data.stats.shape[1])
     # model = ResNet1D(
     #                     in_channels=15, 
@@ -59,6 +62,7 @@ def fit_model(CV_split):
                             checkpoint_callback=True,
                             callbacks=[early_stop_callback,checkpoint_callback] )
 
+    #TODO: torch.use_deterministic_algorithms(True)
     torch.manual_seed(0)
     np.random.seed(0)
 
