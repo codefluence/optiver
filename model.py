@@ -15,7 +15,7 @@ from sklearn.metrics import roc_auc_score
 
 class PatternFinder(LightningModule):
 
-    def __init__(self, in_channels, stats_num, series_medians, multf=2):
+    def __init__(self, in_channels, maps_num, stats_num, series_medians, multf=1):
 
         super(PatternFinder, self).__init__()
 
@@ -23,16 +23,21 @@ class PatternFinder(LightningModule):
 
         #self.block1 = Dablock(in_channels*3, multf//2)
 
-        self.block0 = Dablock(in_channels, multf)
-        #self.block1 = Dablock(in_channels, multf)
-        #self.block2 = Dablock(in_channels, multf, dilation=2)
-        #self.block3 = Dablock(in_channels, multf)
+        tot_channels = in_channels# + maps_num*3*multf
+        input_width = sum(tot_channels * multf * [4*3]) #+ stats_num  #,3*2
 
-        input_width = sum(in_channels * multf * [4*3]) + stats_num  #,3*2
+        self.block0 = Dablock(tot_channels, multf)
+        ######self.block1 = Dablock(tot_channels, multf)
+        #self.block2 = Dablock(tot_channels, multf, dilation=2)
+        ######self.block3 = Dablock(tot_channels, multf)
 
-        di = multf*2
-        self.head = nn.Linear(input_width, input_width//di)
-        self.linear = nn.Linear(input_width//di, 1)
+        self.mapper0 = nn.Conv2d(maps_num, maps_num*multf, kernel_size=2)
+        self.mapper1 = nn.Conv2d(maps_num*multf, maps_num*2*multf, kernel_size=2)
+        self.mapper2 = nn.Conv2d(maps_num*2*multf, maps_num*3*multf, kernel_size=2)
+
+        #di = multf*2
+        #self.head = nn.Linear(input_width, input_width//di)
+        self.linear = nn.Linear(input_width, 1)#//di
 
         #self.loss = nn.MSELoss()
 
@@ -40,9 +45,14 @@ class PatternFinder(LightningModule):
 
         return torch.sqrt(torch.sum(weight * (input - target)**2) / torch.sum(weight))
 
-    def forward(self, series, stats):
+    def forward(self, series, maps, stats):
 
-        x0 = self.block0(series)
+        xmap = torch.cat((maps[:,:,:,1:2],maps[:,:,:,1:2],maps[:,:,:,1:2],maps),dim=-1)
+        xmap = self.mapper0(xmap)
+        xmap = self.mapper1(xmap)
+        xmap = self.mapper2(xmap).squeeze(2)
+
+        x0 = self.block0(series)#torch.hstack((series,xmap)))
         #x1 = self.block1(series - self.series_medians) #TODO
 
         #x1_a = F.avg_pool1d(series, kernel_size=3, stride=1, padding=1)
@@ -57,24 +67,29 @@ class PatternFinder(LightningModule):
         # x3 = F.avg_pool1d(x3, kernel_size=7, stride=1)
         # x3 = self.block3(x3)
 
-        x = torch.hstack((x0,stats))
+        x = x0#torch.hstack((x0,stats))
 
-        x = self.head(x)
-        x = F.leaky_relu(x)
+
+        #x = self.head(x)
+        #x = F.leaky_relu(x)
         #x = F.dropout(x, p=0.2)
 
         return self.linear(x), x
 
     def training_step(self, train_batch, batch_idx):
 
-        series, stats, targets = train_batch
+        series, maps, stats, targets = train_batch
 
         fut_rea_vol  = targets[:,-4]
-        logits = self.forward(series, stats)[0]
 
-        loss = torch.sqrt(torch.mean(torch.square((fut_rea_vol - logits.squeeze()) / fut_rea_vol), dim=0))
+        upordown = ((targets[:,-1]>0)*1).float()
+
+        logits = self.forward(series, maps, stats)[0]
+
+        #loss = torch.sqrt(torch.mean(torch.square((fut_rea_vol - logits.squeeze()) / fut_rea_vol), dim=0))
         #loss = self.loss(logits.squeeze(), delta)
         #loss = self.RMSE(logits.squeeze(), fut_rea_vol, 1 / (fut_rea_vol)**2)
+        loss = F.binary_cross_entropy_with_logits(logits.squeeze(), upordown, weight = 1 / (fut_rea_vol)**2)
 
         self.log('train_loss', loss)
 
@@ -82,49 +97,60 @@ class PatternFinder(LightningModule):
 
     def validation_step(self, val_batch, batch_idx):
 
-        series, stats, targets = val_batch
+        series, maps, stats, targets = val_batch
 
         increase     = targets[:,-1]
         delta        = targets[:,-2]
         past_rea_vol = targets[:,-3]
         fut_rea_vol  = targets[:,-4]
 
+        upordown = ((targets[:,-1]>0)*1).float()
+
         #TODO: nograd needed?
 
         #fut_rea_vol_hat
-        logits = self.forward(series, stats)[0]  #,stats.reshape(-1,1)
+        logits = self.forward(series, maps, stats)[0]  #,stats.reshape(-1,1)
 
-        loss = torch.sqrt(torch.mean(torch.square((fut_rea_vol - logits.squeeze()) / fut_rea_vol), dim=0)).cpu().item()
+        #loss = torch.sqrt(torch.mean(torch.square((fut_rea_vol - logits.squeeze()) / fut_rea_vol), dim=0)).cpu().item()
         #loss = self.loss(logits.squeeze(), delta).cpu().item()
         #loss = self.RMSE(logits.squeeze(), fut_rea_vol, 1 / (fut_rea_vol)**2).cpu().item()
-
-        #fut_rea_vol_estim = past_rea_vol + logits.squeeze()
-        fut_rea_vol_estim = logits.squeeze()
-        val_increase_mae_estim = fut_rea_vol_estim / past_rea_vol - 1
-        val_increase_mae = torch.mean(torch.abs(val_increase_mae_estim - increase)).cpu().item()
-
-        val_rmspe = torch.sqrt(torch.mean(torch.square((fut_rea_vol - fut_rea_vol_estim) / fut_rea_vol), dim=0)).cpu().item()
+        loss = F.binary_cross_entropy_with_logits(logits.squeeze(), upordown, weight = 1 / (fut_rea_vol)**2)
 
         self.log('val_loss', loss)
-        self.log('val_increase_mae', val_increase_mae)
-        self.log('val_rmspe', val_rmspe)
 
-        if batch_idx==0:
-            print()
-            print(  f'\033[93m-------',
-                    'val_rmspe', np.round(val_rmspe,3),
-                    '| val_loss', np.round(loss,7),
-                    '| val_increase_mae',np.round(val_increase_mae,2),
-                    '| mean(real_increase)',np.round(torch.mean(torch.abs(increase)).cpu().item(),2),
-                    'median(real_increase)',np.round(torch.median(torch.abs(increase)).cpu().item(),2),
-                    f'-------\033[0m')
+        pred = torch.sigmoid(logits)
+
+        val_auc = roc_auc_score(y_true  = upordown.detach().cpu().squeeze(),
+                                y_score = pred.detach().cpu().squeeze())
+
+        self.log('val_auc', val_auc)
+
+        # #fut_rea_vol_estim = past_rea_vol + logits.squeeze()
+        # fut_rea_vol_estim = logits.squeeze()
+        # val_increase_mae_estim = fut_rea_vol_estim / past_rea_vol - 1
+        # val_increase_mae = torch.mean(torch.abs(val_increase_mae_estim - increase)).cpu().item()
+
+        # val_rmspe = torch.sqrt(torch.mean(torch.square((fut_rea_vol - fut_rea_vol_estim) / fut_rea_vol), dim=0)).cpu().item()
+
+        # self.log('val_increase_mae', val_increase_mae)
+        # self.log('val_rmspe', val_rmspe)
+
+        # if batch_idx==0:
+        #     print()
+        #     print(  f'\033[93m-------',
+        #             'val_rmspe', np.round(val_rmspe,3),
+        #             '| val_loss', np.round(loss,7),
+        #             '| val_increase_mae',np.round(val_increase_mae,2),
+        #             '| mean(real_increase)',np.round(torch.mean(torch.abs(increase)).cpu().item(),2),
+        #             'median(real_increase)',np.round(torch.median(torch.abs(increase)).cpu().item(),2),
+        #             f'-------\033[0m')
 
 
     def configure_optimizers(self):
 
-        optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
-        sccheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=3, factor=1/5, verbose=True, min_lr=1e-6)
-        return [optimizer], {'scheduler': sccheduler, 'monitor': 'val_rmspe'}
+        optimizer = torch.optim.Adam(self.parameters(), lr=1e-2)
+        sccheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', patience=3, factor=1/5, verbose=True, min_lr=1e-6)
+        return [optimizer], {'scheduler': sccheduler, 'monitor': 'val_auc'}
 
 
 

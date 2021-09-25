@@ -3,7 +3,6 @@ import gc
 import json
 import math
 import pickle
-import platform
 from tqdm import tqdm
 
 from sklearn.preprocessing import StandardScaler
@@ -23,7 +22,9 @@ from scipy.signal import find_peaks
 from scipy.interpolate import interp1d
 from scipy.signal import argrelmax
 
-np.set_printoptions(threshold=2000, linewidth=140, precision=6, edgeitems=20, suppress=1)
+from utils import get_time_series
+
+np.set_printoptions(threshold=2000, linewidth=140, precision=5, edgeitems=20, suppress=1)
 pd.set_option('display.max_rows', 600)
 
 
@@ -36,8 +37,6 @@ class OptiverDataModule(pl.LightningDataModule):
         super(OptiverDataModule, self).__init__()
 
         self.CV_split = CV_split
-
-        epsilon = 1e-6
 
         with open(settings_path) as f:
             
@@ -62,69 +61,63 @@ class OptiverDataModule(pl.LightningDataModule):
             print('creating tensors...')
             series, targets = get_time_series(settings)
 
-        #TODO: remove
-        ##############################################
-        series[:,-2:] = np.nan_to_num(series[:,-2:])
-        series[:,8][series[:,8]==0] = 1
-        ##############################################
-
-        assert((~ np.isfinite(series[:,:8])).sum() == 0)
-        assert((~ np.isfinite(series[:,-2:])).sum() == 0)
+        assert((~np.isfinite(series[:,:8])).sum() == 0)
+        assert((~np.isfinite(series[:,-2:])).sum() == 0)
 
 
-
-        series  = series[::2]
-        targets = targets[::2]
-
-
-
-        signals = np.empty((len(series),2), dtype=np.float32)
-        signals[:] = np.nan
-
+        # Reduce the number of series for the experiments
+        # series  = series[::2]
+        # targets = targets[::2]
 
 
         print('computing stock stats...')
 
-        stats = np.empty((len(series),2), dtype=np.float32)
-        stats[:] = np.nan
+        stock_id = targets[:,0]
 
         # sum of executed_qty for each data point
-        stats[:,0] = np.sum(series[:,9], axis=1)
+        execqty_sum = np.sum(series[:,9], axis=1)
 
-        texecqty_mean_all = np.empty((len(series)), dtype=np.float32)
-        texecqty_mean_all[:] = np.nan
+        stock_execqty_mean = np.repeat(np.nan, len(series)).astype(np.float32)
 
         # for each stock id, the mean of the sum of executed_qty is computed
         # this number tells abouts the usual volume of each stock
-        for i in np.unique(targets[:,0]):
-            idx = targets[:,0] == int(i)
-            texecqty_mean_all[idx] = np.mean(stats[idx,0])
+        for i in np.unique(stock_id):
+            idx = stock_id == int(i)
+            stock_execqty_mean[idx] = np.mean(execqty_sum[idx])
 
-        stats[:,0] = stats[:,0] / texecqty_mean_all
+        execqty_sum = execqty_sum / stock_execqty_mean
 
-        print('processing series...')
 
-        processed = []
+        print('processing series, maps and signals...')
+
+        processed_series = []
+        processed_maps = []
+        signals = []
+        past_real_vol = np.repeat(np.nan, len(series)).astype(np.float32)
 
         num_batches = math.ceil(len(series) / batch_size)
 
         for bidx in tqdm(range(num_batches)):
 
-            batch = []
+            batch_series = []
+            batch_maps = []
+            batch_signals = []
 
             start = bidx*batch_size
             end   = start + min(batch_size, len(series) - start)
 
-            def process(raw, toinclude):
+            def process(raw, toinclude, generatesignals=True):
 
-                windows = raw.unfold(1,mks,1)
+                if generatesignals or len(toinclude)>0:
 
-                rolling_mean = torch.mean(windows, dim=2)
-                rolling_std  = torch.std(windows, dim=2)
-                rolling_max  = torch.max(windows, dim=2)[0]
-                rolling_min  = torch.min(windows, dim=2)[0]
+                    windows = raw.unfold(1,mks,1)
 
-                del windows
+                    rolling_mean = torch.mean(windows, dim=2)
+                    rolling_std  = torch.std(windows, dim=2)
+                    rolling_max  = torch.max(windows, dim=2)[0]
+                    rolling_min  = torch.min(windows, dim=2)[0]
+
+                    del windows
 
                 results = []
 
@@ -134,29 +127,45 @@ class OptiverDataModule(pl.LightningDataModule):
                 if 3 in toinclude: results.append(rolling_max)
                 if 4 in toinclude: results.append(rolling_min)
 
-                if 5 in toinclude:
+                if generatesignals:
+
                     rolling_deviation = (raw[:,-rolling_mean.shape[1]:] - rolling_mean) / rolling_std
-                    results.append(torch_nan_to_num(rolling_deviation, nan=0, posinf=0, neginf=0))
+                    rolling_deviation = torch_nan_to_num(rolling_deviation, nan=0, posinf=0, neginf=0)
+
+                    h = rolling_deviation.shape[1] // 2
+                    batch_signals.append( ((torch.sum((rolling_deviation[:,:h] > 5) | (rolling_deviation[:,:h] < -5),dim=1)>0)*1).cpu().numpy() )
+                    batch_signals.append( ((torch.sum((rolling_deviation[:,-h:] > 5) | (rolling_deviation[:,-h:] < -5),dim=1)>0)*1).cpu().numpy() )
+
+                if 5 in toinclude:
+                    results.append(rolling_deviation)
 
                 if 6 in toinclude:
                     rolling_minmaxspread = rolling_max / rolling_min -1
                     results.append(torch_nan_to_num(rolling_minmaxspread, nan=0, posinf=0, neginf=0))
 
-                if 7 in toinclude:
-                    h = rolling_deviation.shape[1] // 2
-                    signals[start:end,0] = ((torch.sum((rolling_deviation[:,:h] > 5) | (rolling_deviation[:,:h] < -5),dim=1)>0)*1).cpu().numpy()
-                    signals[start:end,1] = ((torch.sum((rolling_deviation[:,-h:] > 5) | (rolling_deviation[:,-h:] < -5),dim=1)>0)*1).cpu().numpy()
-
                 #TODO: con una sola linea peta
                 for i in range(len(results)):
 
-                    # copy is necessary?
-                    results[i] = F.avg_pool1d(results[i].unsqueeze(0), kernel_size=kernel_size,
-                                              stride=stride).squeeze(0).cpu().numpy().copy()
+                    #TODO: copy is necessary?
+                    results[i] = F.avg_pool1d(results[i].unsqueeze(0), kernel_size=kernel_size, stride=stride).squeeze(0).cpu().numpy().copy()
 
                     assert((~np.isfinite(results[i])).sum() == 0)
 
-                batch.extend(results)
+                batch_series.extend(results)
+
+            def process_map(raws):
+
+                #TODO: con una sola linea peta
+                for i in range(4):
+
+                    #TODO: copy is necessary?
+                    raws[i] = F.avg_pool1d(raws[i].unsqueeze(0), kernel_size=kernel_size, stride=stride).squeeze(0).cpu().numpy().copy()
+
+                    assert((~np.isfinite(raws[i])).sum() == 0)
+
+                batch_maps.append(np.stack(raws,axis=1))
+
+            texecqty_mean = torch.tensor(stock_execqty_mean[start:end], device=device).unsqueeze(1)
 
             bid_px1 = torch.tensor(series[start:end,0], device=device)
             ask_px1 = torch.tensor(series[start:end,1], device=device)
@@ -168,11 +177,19 @@ class OptiverDataModule(pl.LightningDataModule):
             bid_qty2 = torch.tensor(series[start:end,6], device=device)
             ask_qty2 = torch.tensor(series[start:end,7], device=device)
 
+            process_map([   ask_qty2 / texecqty_mean,
+                            ask_qty1 / texecqty_mean,
+                            bid_qty1 / texecqty_mean,
+                            bid_qty2 / texecqty_mean    ])
+
+            process_map([   torch_diff(ask_qty2 / texecqty_mean),
+                            torch_diff(ask_qty1 / texecqty_mean),
+                            torch_diff(bid_qty1 / texecqty_mean),
+                            torch_diff(bid_qty2 / texecqty_mean)    ])
+
             executed_px = torch.tensor(series[start:end,8], device=device)
             executed_qty = torch.tensor(series[start:end,9], device=device)
             order_count = torch.tensor(series[start:end,10], device=device)
-
-            texecqty_mean = torch.tensor(texecqty_mean_all[start:end], device=device).unsqueeze(1)
 
             # executed_qty_dist = torch.divide(executed_qty, texecqty_mean)
             # executed_qty_dist = torch_nan_to_num(executed_qty_dist, posinf=0, neginf=0)
@@ -186,8 +203,6 @@ class OptiverDataModule(pl.LightningDataModule):
 
             # Inspired on ...
             def get_liquidityflow(prices, qties, isbuy):
-
-                #torch.cuda.empty_cache()
 
                 price_diff = torch_diff(prices)
                 vol_diff   = torch_diff(qties)
@@ -204,17 +219,22 @@ class OptiverDataModule(pl.LightningDataModule):
                             (price_diff > 0)  * torch.roll(qties, 1, 1)[:,1:] + \
                             (price_diff < 0)  * qties[:,1:]
 
-            # OLI =   get_liquidityflow(bid_px1, bid_qty1 / texecqty_mean, True) + \
-            #         get_liquidityflow(ask_px1, ask_qty1 / texecqty_mean, False) + \
-            #         get_liquidityflow(bid_px2, bid_qty2 / texecqty_mean, True) + \
-            #         get_liquidityflow(ask_px2, ask_qty2 / texecqty_mean, False)
+            OBLa2 = get_liquidityflow(ask_px2, ask_qty2 / texecqty_mean, False)
+            OBLa1 = get_liquidityflow(ask_px1, ask_qty1 / texecqty_mean, False)
+            OBLb1 = get_liquidityflow(bid_px1, bid_qty1 / texecqty_mean, True)
+            OBLb2 = get_liquidityflow(bid_px2, bid_qty2 / texecqty_mean, True)
 
+            process_map([OBLa2, OBLa1, OBLb1, OBLb2])
+
+            #TODO suma de OLIs
             #process(OLI)
 
             t_bid_size = bid_qty1 + bid_qty2
             t_ask_size = ask_qty1 + ask_qty2
 
             # vol_total_diff = reduce(torch_diff(torch.log(t_bid_size + t_ask_size)))
+
+            epsilon = 1e-6
 
             # vol_unbalance1 = reduce(torch_diff(t_ask_size / ( t_ask_size + t_bid_size + epsilon)))
             # vol_unbalance2 = reduce(torch_diff((ask_qty2 + bid_qty2 - ask_qty1 - bid_qty1) / (texecqty_mean + epsilon)))
@@ -228,7 +248,7 @@ class OptiverDataModule(pl.LightningDataModule):
             ##########################################################################################################
 
             WAP = (bid_px1*ask_qty1 + ask_px1*bid_qty1) / (bid_qty1 + ask_qty1)
-            process(WAP,[0,2,5,6,7])####################
+            #process(WAP,[0,2,5,6]) ####################
             ########################## BAJO CONTROL #############################
             # # Inspired on https://www.investopedia.com/terms/u/.....
             # bollinger_deviation = (WAP_rolling_mean - WAP[:,-WAP_rolling_mean.shape[1]:]) > (WAP_rolling_std + epsilon)*2
@@ -239,8 +259,15 @@ class OptiverDataModule(pl.LightningDataModule):
             #ATR
             #process(WAP_rolling_max / WAP_rolling_min - 1)####################
 
+            process(ask_px2 / WAP - 1, [0], generatesignals=False)
+            process(ask_px1 / WAP - 1, [0], generatesignals=False)
+            process(WAP / bid_px1 - 1, [0], generatesignals=False)
+            process(WAP / bid_px2 - 1, [0], generatesignals=False)
+
+            process(WAP,[0])
+
             log_returns = torch_diff(torch.log(WAP))
-            process(log_returns,[0,2,3,5])#################### 0y1, 3y6 redundantes?
+            #process(log_returns,[0,2,3,5]) #################### 0y1, 3y6 redundantes?
 
             # print()
             # print('Volatility decreases in general:')
@@ -253,7 +280,7 @@ class OptiverDataModule(pl.LightningDataModule):
             #process(executed_px_returns) #NO gran mejoria respecto log_returns, PROBAR en lugar del ratio con WAP?
 
             # past realized volatility
-            stats[start:end,1] = torch.sqrt(torch.sum(torch.pow(log_returns,2),dim=1)).cpu().numpy()
+            past_real_vol[start:end] = torch.sqrt(torch.sum(torch.pow(log_returns,2),dim=1)).cpu().numpy()
 
             # moving_realized_vols = []
 
@@ -277,12 +304,12 @@ class OptiverDataModule(pl.LightningDataModule):
             #process(midprice_returns) #NO gran mejoria respecto log_returns, PROBAR en lugar del ratio con WAP?
 
             #spread
-            process(ask_px1 / bid_px1 - 1,[0])####################
+            #process(ask_px1 / bid_px1 - 1,[0])####################
 
             #price dev
-            process(deepWAP / WAP - 1,[0])####################
-            process(midprice / WAP - 1,[0])####################
-            process(executed_px / WAP - 1,[0])####################
+            #process(deepWAP / WAP - 1,[0])####################
+            #process(midprice / WAP - 1,[0])####################
+            #process(executed_px / WAP - 1,[0])####################
 
             del bid_px1
             del ask_px1
@@ -349,11 +376,11 @@ class OptiverDataModule(pl.LightningDataModule):
             VWAP = torch.sum(money_flows_windows, axis=2) / torch.sum(executed_qty_windows, axis=2)
             VWAP = torch.tensor(pd.DataFrame(VWAP.cpu().numpy()).ffill(axis=1).values, device=device)
             VWAP = torch_nan_to_num(VWAP) + torch.isnan(VWAP) * torch_nan_to_num(WAP[:,-VWAP.shape[1]:])  # beginning of series
-            process(WAP,[0,2,5,6])###################
+            #process(WAP,[0,2,5,6])###################
 
             VWAP_returns = torch_diff(torch.log(VWAP))
-            process(VWAP_returns,[0,2,3,5])####################
-            #process(VWAP / WAP[:,-VWAP.shape[1]:] - 1)####################
+            #process(VWAP_returns,[0,2,3,5])####################
+            #process(VWAP / WAP[:,-VWAP.shape[1]:] - 1
 
             del money_flow
             del money_flows_windows
@@ -373,7 +400,7 @@ class OptiverDataModule(pl.LightningDataModule):
             WAP_rolling_max  = torch.max(WAP_windows, axis=2).values
             WAP_rolling_min  = torch.min(WAP_windows, axis=2).values
 
-            process(WAP_rolling_std,[1,3,5])  #TODO: 3 y 5 son utiles?
+            #process(WAP_rolling_std,[1,3,5])  #TODO: 3 y 5 son utiles?
 
             del WAP_windows
 
@@ -381,7 +408,7 @@ class OptiverDataModule(pl.LightningDataModule):
 
             # # Inspired on https://www.investopedia.com/terms/u/ulcerindex.asp
             R = torch.pow(100 * (WAP[:,-WAP_rolling_max.shape[1]:] - WAP_rolling_max) / WAP_rolling_max, 2)
-            process(R,[0])
+            #process(R,[0])
 
             # # Inspired on https://www.investopedia.com/articles/trading/08/accumulation-distribution-line.asp
             # CLV = ((executed_px[:,-WAP_rolling_min.shape[1]:] - WAP_rolling_min) - (WAP_rolling_max - executed_px[:,-WAP_rolling_max.shape[1]:])) /   \
@@ -391,7 +418,7 @@ class OptiverDataModule(pl.LightningDataModule):
             # # Inspired on ......
             middle_channel = (WAP_rolling_max + WAP_rolling_min) / 2
             donchian_deviation = (middle_channel - WAP[:,-middle_channel.shape[1]:]) / (WAP_rolling_max - WAP_rolling_min)  #TODO
-            process(torch_nan_to_num(donchian_deviation, nan=0, posinf=0, neginf=0),[0])
+            #process(torch_nan_to_num(donchian_deviation, nan=0, posinf=0, neginf=0),[0])
 
             del middle_channel
             del WAP_rolling_min
@@ -415,152 +442,191 @@ class OptiverDataModule(pl.LightningDataModule):
             del WAP #TODO: antes?
 
 
-            s_lengths = [102 + end_clip//stride]#TODO
+            lengths = [102 + end_clip//stride]#TODO
 
-            for s in batch:
-                s_lengths.append(s.shape[1])
+            for s in batch_series:
+                lengths.append(s.shape[1])
 
-            for i in range(len(batch)):
-                batch[i] = batch[i][:,-min(s_lengths):-end_clip//stride]  #TODO
+            for m in batch_maps:
+                lengths.append(m.shape[2])
 
-            processed.append(np.stack(batch, axis=1))
+            for i in range(len(batch_series)):
+                batch_series[i] = batch_series[i][:,-min(lengths):-end_clip//stride]  #TODO
+
+            for i in range(len(batch_maps)):
+                batch_maps[i] = batch_maps[i][:,:,-min(lengths):-end_clip//stride]  #TODO
+
+            processed_series.append(np.stack(batch_series, axis=1))
+            processed_maps.append(np.stack(batch_maps, axis=1))
+            signals.append(np.stack(batch_signals, axis=1))
 
             gc.collect()
             torch.cuda.empty_cache()
 
-        series = np.vstack(processed)
+        series = np.vstack(processed_series)
+        maps = np.vstack(processed_maps)
+        signals = np.vstack(signals)
         gc.collect()
 
-        print('min:',list(np.round(np.min(series,axis=(0,2)),5)))
-        #print('med:',list(np.round(np.median(series,axis=(0,2)),5)))
-        print('max:',list(np.round(np.max(series,axis=(0,2)),5)))
+        assert((~np.isfinite(signals)).sum() == 0)
 
-        if scale and len(series) > 1:
+        print('series shape:\t',series.shape)
+        print('maps shape:\t',maps.shape)
+        print('signals shape:\t',signals.shape)
 
-            if settings['ENV'] == 'train':
+        print('series min:',list(np.round(np.min(series,axis=(0,2)),5)))
+        #print('series med:',list(np.round(np.median(series,axis=(0,2)),5)))
+        print('series max:',list(np.round(np.max(series,axis=(0,2)),5)))
 
-                series_means = np.expand_dims(np.mean(series, axis=(0,2)),1)
-                series_stds = np.expand_dims(np.std(series, axis=(0,2)),1)
+        print('maps min:',list(np.round(np.min(maps,axis=(0,2,3)),5)))
+        #print('maps med:',list(np.round(np.median(maps,axis=(0,2,3)),5)))
+        print('maps max:',list(np.round(np.max(maps,axis=(0,2,3)),5)))
 
-                np.save(settings['PREPROCESS_DIR'] +'series_means', series_means)
-                np.save(settings['PREPROCESS_DIR'] +'series_stds', series_stds)
-            else:
-
-                series_means = np.load(settings['PREPROCESS_DIR'] +'series_means.npy')
-                series_stds = np.load(settings['PREPROCESS_DIR'] +'series_stds.npy')
-
-            series = (series - series_means) / series_stds
-
-        #TODO
-        # for i in range(series.shape[1]):
-
-        #     scaler = MinMaxScaler().fit(series[:,i].T)
-        #     series[:,i] = scaler.transform(series[:,i].T).T
-
-        series_medians = series_means#TODO:np.median(series, axis=0)
-
-        assert((~np.isfinite(series)).sum() == 0)
-        assert((~np.isfinite(series_medians)).sum() == 0)
-
-        print('series shape:',series.shape)
-
-        self.series = series
-        self.series_medians = series_medians
+        print('signals props:',np.sum(signals,axis=0)/len(signals))
 
         ###############################################################################
 
         print('computing targets...')
 
         fut_rea_vol = targets[:,3]
-        past_rea_vol = stats[:,1]
-        rea_vol_delta = fut_rea_vol - past_rea_vol
-        rea_vol_increase = fut_rea_vol / past_rea_vol - 1
+        rea_vol_delta = fut_rea_vol - past_real_vol
+        rea_vol_increase = fut_rea_vol / past_real_vol - 1
 
         targets = np.hstack((   targets,
-                                np.expand_dims(past_rea_vol,1),
+                                np.expand_dims(past_real_vol,1),
                                 np.expand_dims(rea_vol_delta,1),
                                 np.expand_dims(rea_vol_increase,1)
                             ))
 
         assert((~np.isfinite(targets)).sum() == 0)
 
-        self.targets = targets
-
         ###############################################################################
 
         print('computing series stats...')
 
-        stats_h = []
+        stats = []
 
-        # r = series.shape[2]
-        # ds = [1, 2, 4]
-        # for d in ds:
+        r = series.shape[2]
+        ds = [1, 2, 4]
+        for d in ds:
 
-        #     s = series[:,:,-r//d:]
+            s = series[:,:,-r//d:]
 
-        #     stats_h.append(np.hstack((
+            stats.append(np.hstack((
 
-        #         np.mean(s,axis=2),
-        #         np.std(s,axis=2),
-        #         np.max(s,axis=2),
-        #         np.min(s,axis=2)
+                np.mean(s,axis=2),
+                np.std(s,axis=2),
+                np.max(s,axis=2)
                     
-        #      )))
+             )))
 
-        #     corrs = np.corrcoef(np.hstack((stats_h[-1], np.expand_dims(targets[:,-1],1))).T)[:-1,-1]
-        #     print('corrs for last {} ticks:'.format(r//d), np.round(corrs,2))
+            corrs = np.corrcoef(np.hstack((stats[-1], np.expand_dims(targets[:,-1],1))).T)[:-1,-1]
+            print('corrs for last {} ticks:\t'.format(r//d), np.round(corrs,2))
 
-        # # corrs = np.corrcoef(np.hstack((stats_h[2]-stats_h[1], np.expand_dims(targets[:,-1],1))).T)[:-1,-1]
-        # # print('corrs for {} t - {} t:'.format(r//ds[2], r//ds[1]), np.round(corrs,2))
-        # corrs = np.corrcoef(np.hstack((stats_h[2]-stats_h[0], np.expand_dims(targets[:,-1],1))).T)[:-1,-1]
-        # print('corrs for {} t - {} t:'.format(r//ds[2], r//ds[0]), np.round(corrs,2))
+        corrs = np.corrcoef(np.hstack((stats[2]-stats[0], np.expand_dims(targets[:,-1],1))).T)[:-1,-1]
+        print('corrs for {} ti - {} ti:\t'.format(r//ds[2], r//ds[0]), np.round(corrs,2))
+        corrs = np.corrcoef(np.hstack((stats[2]-stats[1], np.expand_dims(targets[:,-1],1))).T)[:-1,-1]
+        print('corrs for {} ti - {} ti:\t'.format(r//ds[2], r//ds[1]), np.round(corrs,2))
+        corrs = np.corrcoef(np.hstack((stats[1]-stats[0], np.expand_dims(targets[:,-1],1))).T)[:-1,-1]
+        print('corrs for {} ti - {} ti:\t'.format(r//ds[1], r//ds[0]), np.round(corrs,2))
 
-        stats_h.append(stats)
-        stats_h.append(signals)#######################
-        stats = np.hstack(stats_h)
+        stats.append(execqty_sum.reshape(-1,1))
+        stats.append(past_real_vol.reshape(-1,1))
+        stats = np.hstack(stats)
 
         corrs = np.corrcoef(np.hstack((stats, np.expand_dims(targets[:,-1],1))).T)[:-1,-1]
-        print('abs corrs sorted:')
+        print('sorted abs corrs:')
         print(np.round(np.sort(np.abs(corrs))[::-1],2))
 
-        THRESHOLD = 0.
-        stats = stats[:,np.abs(corrs)>THRESHOLD]  #TODO
-        print('stats shape',stats.shape)
-
-        if scale and len(stats) > 1:
-
-            if settings['ENV'] == 'train':
-
-                #TODO: usar solo los datos del train set
-                stats_means = np.mean(stats, axis=0)
-                stats_stds = np.std(stats, axis=0)
-
-                np.save(settings['PREPROCESS_DIR'] +'stats_means', stats_means)
-                np.save(settings['PREPROCESS_DIR'] +'stats_stds', stats_stds)
-            else:
-
-                stats_means = np.load(settings['PREPROCESS_DIR'] +'stats_means.npy')
-                stats_stds = np.load(settings['PREPROCESS_DIR'] +'stats_stds.npy')
-
-            stats = (stats - stats_means) / stats_stds
+        #THRESHOLD = 0.
+        #stats = stats[:,np.abs(corrs)>THRESHOLD]  #TODO
+        print('stats shape:\t',stats.shape)
 
         print('coeffs of selected stats:')
         print(np.round(np.corrcoef(np.hstack((stats, np.expand_dims(targets[:,-1],1))).T)[:-1,-1],2))
 
-        assert((~np.isfinite(stats)).sum() == 0)
+        ###############################################################################
 
+        print('scaling...')
+
+        idx_train = stock_id % 5 != CV_split
+
+        if scale and len(series) > 1:
+
+            stmf = settings['PREPROCESS_DIR'] + 'stats_means_{}.npy'.format(CV_split)
+            stsf = settings['PREPROCESS_DIR'] + 'stats_stds_{}.npy'.format(CV_split)
+            semf = settings['PREPROCESS_DIR'] + 'series_means_{}.npy'.format(CV_split)
+            sesf = settings['PREPROCESS_DIR'] + 'series_stds_{}.npy'.format(CV_split)
+            mamf = settings['PREPROCESS_DIR'] + 'maps_means_{}.npy'.format(CV_split)
+            masf = settings['PREPROCESS_DIR'] + 'maps_stds_{}.npy'.format(CV_split)
+
+            if settings['ENV'] == 'train':
+
+                stats_means = np.mean(stats[idx_train], axis=0)
+                stats_stds = np.std(stats[idx_train], axis=0)
+
+                np.save(stmf, stats_means)
+                np.save(stsf, stats_stds)
+            else:
+
+                stats_means = np.load(stmf)
+                stats_stds  = np.load(stsf)
+
+            stats = (stats - stats_means) / stats_stds
+
+            if settings['ENV'] == 'train':
+
+                series_means = np.expand_dims(np.mean(series[idx_train], axis=(0,2)),1)
+                series_stds = np.expand_dims(np.std(series[idx_train], axis=(0,2)),1)
+
+                np.save(semf, series_means)
+                np.save(sesf, series_stds)
+            else:
+
+                series_means = np.load(semf)
+                series_stds  = np.load(sesf)
+
+            series = (series - series_means) / series_stds
+
+            if settings['ENV'] == 'train':
+
+                maps_means = np.expand_dims(np.mean(maps[idx_train], axis=(0,2,3)),1)
+                maps_stds = np.expand_dims(np.std(maps[idx_train], axis=(0,2,3)),1)
+
+                np.save(mamf, maps_means)
+                np.save(masf, maps_stds)
+            else:
+
+                maps_means = np.load(mamf)
+                maps_stds  = np.load(masf)
+
+            maps = (maps - np.expand_dims(maps_means,1)) / np.expand_dims(maps_stds,1)
+
+        assert((~np.isfinite(series)).sum() == 0)
+        assert((~np.isfinite(series_means)).sum() == 0)
+        assert((~np.isfinite(stats)).sum() == 0)
+        
+        self.series = series
+        self.maps = maps
+        self.signals = signals
         self.stats = stats
+        self.targets = targets
+
+        print('computing series medians...')
+        self.series_medians = np.median(series, axis=0)
+        #TODO: maps medians
+
 
     def train_dataloader(self):
 
         #TODO: sorting por volatilidad
         idx = self.targets[:,0] % 5 != self.CV_split
-        return DataLoader(SeriesDataSet(self.series[idx], self.stats[idx], self.targets[idx]), batch_size=4096, shuffle=True)
+        return DataLoader(SeriesDataSet(self.series[idx], self.maps[idx], self.stats[idx], self.targets[idx]), batch_size=4096, shuffle=True)
 
     def val_dataloader(self):
 
         idx = self.targets[:,0] % 5 == self.CV_split
-        return DataLoader(SeriesDataSet(self.series[idx], self.stats[idx], self.targets[idx]), batch_size=44039, shuffle=False)
+        return DataLoader(SeriesDataSet(self.series[idx], self.maps[idx], self.stats[idx], self.targets[idx]), batch_size=44039, shuffle=False)
 
 
 
@@ -580,90 +646,14 @@ def torch_nan_to_num(tensor, nan=0., posinf=0., neginf=0., hack=False):
 
 
 
-def get_time_series(settings):
-
-    series = []
-    vols = []
-
-    targets = pd.read_csv(settings['DATA_DIR'] + settings['ENV'] + '.csv')
-
-    for folder in 'book_'+settings['ENV']+'.parquet', 'trade_'+settings['ENV']+'.parquet': 
-
-        file_paths = []
-        path_root = settings['DATA_DIR'] + folder + '/'
-
-        for path, _, files in os.walk(path_root):
-            for name in files:
-                file_paths.append(os.path.join(path, name))
-
-        for file_path in tqdm(file_paths):
-
-            df = pd.read_parquet(file_path, engine='pyarrow')
-            slash = '\\' if platform.system() == 'Windows' else '/'
-            stock_id = int(file_path.split(slash)[-2].split('=')[-1])
-
-            for time_id in np.unique(df.time_id):
-
-                df_time = df[df.time_id == time_id].reset_index(drop=True)
-                with_changes_len = len(df_time)
-
-                # In kaggle public leaderboard, some books don't start with seconds_in_bucket=0
-                # if 'book' in file_path:
-                #     assert df_time.seconds_in_bucket[0] == 0
-
-                df_time = df_time.reindex(list(range(600)))
-
-                missing = set(range(600)) - set(df_time.seconds_in_bucket)
-                df_time.loc[with_changes_len:,'seconds_in_bucket'] = list(missing)
-
-                df_time = df_time.sort_values(by='seconds_in_bucket').reset_index(drop=True)
-
-                if 'book' in file_path:
-
-                    df_time = df_time.iloc[:,2:].ffill(axis=0)
-
-                    # In kaggle public leaderboard, some books don't start with seconds_in_bucket=0
-                    #TODO: workaround for https://www.kaggle.com/c/optiver-realized-volatility-prediction/discussion/251775
-                    df_time.bfill(axis=0, inplace=True)
-
-                    # For spans with no trades, values of traded_qty and traded_count are set to 0
-                    trades_columns = np.repeat(np.nan, 3*600).reshape(3,600).astype(np.float32)
-                    trades_columns[-2:] = 0.
-
-                    series.append(np.vstack((df_time.T.to_numpy(dtype=np.float32), trades_columns)))
-
-                    if 'target' in targets.columns:
-                        entry = targets.loc[(targets.stock_id==stock_id) & (targets.time_id==time_id), 'target']
-                    else:
-                        entrey = []
-
-                    vols.append(np.array((  stock_id, time_id, len(vols), 
-                                            entry.item() if len(entry)==1 else np.nan), dtype=np.float32))
-
-                elif 'trade' in file_path:
-
-                    if isinstance(vols, list):
-                        series = np.stack(series, axis=0)
-                        vols = np.stack(vols, axis=0)
-
-                    # Avg trade prices are only forward-filled, nan values will be replaced with WAP later
-                    df_time = df_time.iloc[:,2:].fillna({'size':0, 'order_count':0})
-                    df_time.ffill(axis=0, inplace=True)
-
-                    tensor_index = vols[(vols[:,0]==stock_id) & (vols[:,1]==time_id), 2].item()
-                    series[int(tensor_index),-3:] = df_time.T.to_numpy(dtype=np.float32)
-
-    return series, vols
-
-
-
 class SeriesDataSet(Dataset):
     
-    def __init__(self, series, stats, targets):
+    def __init__(self, series, maps, stats, targets):
 
         super(SeriesDataSet, self).__init__()
 
         self.series = series
+        self.maps = maps
         self.stats = stats
         self.targets = targets
 
@@ -673,84 +663,10 @@ class SeriesDataSet(Dataset):
 
     def __getitem__(self, idx):
 
-        return self.series[idx], self.stats[idx], self.targets[idx]
-
-                # def get_extrema(array):
-                #     #TODO: assert((~ torch.isfinite(array)).sum() == 0)
-                #     h = array.shape[1]
-
-                #     batch2.append(F.max_pool1d(array[:,:h//2].unsqueeze(0), array[:,:h//2].shape[1], 1).squeeze(0).cpu().numpy().copy())
-                #     batch2.append(F.max_pool1d(array[:,h//2:-h//4].unsqueeze(0), array[:,h//2:-h//4].shape[1], 1).squeeze(0).cpu().numpy().copy())
-                #     batch2.append(F.max_pool1d(array[:,-h//4:].unsqueeze(0), array[:,-h//4:].shape[1], 1).squeeze(0).cpu().numpy().copy())
-
-                #     batch2.append(F.max_pool1d(-1*array[:,:h//2].unsqueeze(0), array[:,:h//2].shape[1], 1).squeeze(0).cpu().numpy().copy())
-                #     batch2.append(F.max_pool1d(-1*array[:,h//2:-h//4].unsqueeze(0), array[:,h//2:-h//4].shape[1], 1).squeeze(0).cpu().numpy().copy())
-                #     batch2.append(F.max_pool1d(-1*array[:,-h//4:].unsqueeze(0), array[:,-h//4:].shape[1], 1).squeeze(0).cpu().numpy().copy())
-
-                # empty = torch.zeros((raw.shape[0],raw.shape[1]-1), device='cuda')
-                # empty[:] = np.nan
-                # reversedextended = torch.flip(torch.hstack((raw,empty)),dims=(1,))
-                # windows = reversedextended.unfold(1,raw.shape[1],1).cpu().numpy()
-                # torch.cuda.empty_cache()
-
-                # md = np.nanmean(windows, axis=2)[:,::-1].copy()
-                # results.append(torch.tensor(md, device='cuda' ))
-                # ss = np.nanstd(windows, axis=2)[:,::-1].copy()
-                # results.append(torch.tensor(ss, device='cuda' ))
-
-
-                    # #TODO: post-pro
-                    # def caca(a_series):
-
-                    #     peaks = argrelmax(a_series, order=2, axis=0)[0]
-
-                    #     if not 0 in peaks:
-                    #         peaks = np.append(peaks, [0])
-
-                    #     if not (len(a_series)-1) in peaks:
-                    #         peaks = np.append(peaks, [len(a_series)-1])
-
-                    #     try:
-                    #         f = interp1d(peaks, a_series[peaks], kind='cubic')
-                    #     except:
-                    #         return a_series
-
-                    #     return f(range(len(a_series)))
-                    
-                    # results[i] = np.apply_along_axis(caca, 1, results[i])
+        return self.series[idx], self.maps[idx], self.stats[idx], self.targets[idx]
 
 
 
 if __name__ == '__main__':
 
-        # sliding_window_view not available for numpy < 1.20
-        # moving_realized_volatility = np.apply_along_axis(lambda x: np.sqrt(np.sum(x**2)), arr=windows, axis=2)
-
     data = OptiverDataModule()
-
-    # truth = pd.read_csv(DATA_DIR+'train.csv')
-
-    # stockids = np.unique(truth.stock_id)
-    # timeids  = np.unique(truth.time_id)
-
-    # thematrix = np.empty((max(stockids)+1, max(timeids)+1))
-    # thematrix[:] = np.nan
-
-    # for sid in stockids:
-
-    #     subdf = truth.loc[truth.stock_id == sid]
-    #     thematrix[sid,subdf.time_id] = subdf.target
-
-    # arma = np.nanargmax(thematrix)
-    # thematrix[arma // thematrix.shape[1], arma % thematrix.shape[1]]
-
-
-    pass
-
-
-        #TODO: correlations
-
-        # for i in range(NUM_SERIES):
-
-        #     scaler = MinMaxScaler().fit(s[:,i].T)
-        #     s[:,i] = scaler.transform(s[:,i].T).T

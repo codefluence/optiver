@@ -21,6 +21,7 @@ def fit_model(CV_split):
     data = OptiverDataModule(CV_split=CV_split)
 
     model = PatternFinder(  in_channels=data.series.shape[1],
+                            maps_num=data.maps.shape[1],
                             stats_num=data.stats.shape[1],
                             series_medians=data.series_medians)
 
@@ -41,10 +42,10 @@ def fit_model(CV_split):
     dirpath='./checkpoints/'
 
     early_stop_callback = EarlyStopping(
-        monitor='val_rmspe',
+        monitor='val_auc',
         patience=12,
         verbose=True,
-        mode='min'
+        mode='max'
     )
 
     checkpoint_callback = ModelCheckpoint(
@@ -52,8 +53,8 @@ def fit_model(CV_split):
         filename=filename,
         save_top_k=1,
         verbose=True,
-        monitor='val_rmspe',
-        mode='min'
+        monitor='val_auc',
+        mode='max'
     )
 
     trainer = pl.Trainer(   logger=pl_loggers.TensorBoardLogger('./logs/'),
