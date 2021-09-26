@@ -42,10 +42,11 @@ def fit_model(CV_split):
     dirpath='./checkpoints/'
 
     early_stop_callback = EarlyStopping(
-        monitor='val_auc',
-        patience=12,
+        monitor='val_rmspe',
+        patience=15,
         verbose=True,
-        mode='max'
+        mode='min',
+        min_delta=0.0002
     )
 
     checkpoint_callback = ModelCheckpoint(
@@ -53,13 +54,13 @@ def fit_model(CV_split):
         filename=filename,
         save_top_k=1,
         verbose=True,
-        monitor='val_auc',
-        mode='max'
+        monitor='val_rmspe',
+        mode='min'
     )
 
     trainer = pl.Trainer(   logger=pl_loggers.TensorBoardLogger('./logs/'),
                             gpus=1,
-                            max_epochs=100,
+                            max_epochs=1000,
                             checkpoint_callback=True,
                             callbacks=[early_stop_callback,checkpoint_callback] )
 

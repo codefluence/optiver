@@ -15,7 +15,7 @@ from sklearn.metrics import roc_auc_score
 
 class PatternFinder(LightningModule):
 
-    def __init__(self, in_channels, maps_num, stats_num, series_medians, multf=1):
+    def __init__(self, in_channels, maps_num, stats_num, series_medians, multf=3):
 
         super(PatternFinder, self).__init__()
 
@@ -23,20 +23,21 @@ class PatternFinder(LightningModule):
 
         #self.block1 = Dablock(in_channels*3, multf//2)
 
-        tot_channels = in_channels# + maps_num*3*multf
-        input_width = sum(tot_channels * multf * [4*3]) #+ stats_num  #,3*2
+        tot_channels = in_channels# + maps_num*multf
+        input_width = sum(tot_channels * multf * [3,2,3]) #+ stats_num  #,3*2
+        print('input_width:',input_width)
 
         self.block0 = Dablock(tot_channels, multf)
         ######self.block1 = Dablock(tot_channels, multf)
-        #self.block2 = Dablock(tot_channels, multf, dilation=2)
+        self.block2 = Dablock(tot_channels, multf, dilation=2)
         ######self.block3 = Dablock(tot_channels, multf)
+        self.block4 = Dablock(tot_channels, multf, dilation=3)
 
         self.mapper0 = nn.Conv2d(maps_num, maps_num*multf, kernel_size=2)
-        self.mapper1 = nn.Conv2d(maps_num*multf, maps_num*2*multf, kernel_size=2)
-        self.mapper2 = nn.Conv2d(maps_num*2*multf, maps_num*3*multf, kernel_size=2)
+        self.mapper1 = nn.Conv2d(maps_num*multf, maps_num*multf, kernel_size=2)
+        self.mapper2 = nn.Conv2d(maps_num*multf, maps_num*multf, kernel_size=2)
 
-        #di = multf*2
-        #self.head = nn.Linear(input_width, input_width//di)
+        #self.head = nn.Linear(input_width, input_width//multf)
         self.linear = nn.Linear(input_width, 1)#//di
 
         #self.loss = nn.MSELoss()
@@ -61,18 +62,18 @@ class PatternFinder(LightningModule):
         #x1 = self.block1(torch.hstack((x1_a, x1_b, x1_c)))
         #x1 = self.block1(x1_b)
 
-        #x2 = self.block2(series)
+        x2 = self.block2(series)
+        x4 = self.block4(series)
 
         # x3 = F.max_pool1d(series, kernel_size=10, stride=1)
         # x3 = F.avg_pool1d(x3, kernel_size=7, stride=1)
         # x3 = self.block3(x3)
 
-        x = x0#torch.hstack((x0,stats))
+        x = torch.hstack((x0,x2,x4))
 
-
-        #x = self.head(x)
-        #x = F.leaky_relu(x)
-        #x = F.dropout(x, p=0.2)
+        # x = F.dropout(x, p=0.1)
+        # x = self.head(x)
+        # x = F.leaky_relu(x)
 
         return self.linear(x), x
 
@@ -80,18 +81,18 @@ class PatternFinder(LightningModule):
 
         series, maps, stats, targets = train_batch
 
-        fut_rea_vol  = targets[:,-4]
+        fut_rea_vol = targets[:,-4]
 
-        upordown = ((targets[:,-1]>0)*1).float()
+        #upordown = ((targets[:,-1]>0)*1).float()
 
         logits = self.forward(series, maps, stats)[0]
 
         #loss = torch.sqrt(torch.mean(torch.square((fut_rea_vol - logits.squeeze()) / fut_rea_vol), dim=0))
         #loss = self.loss(logits.squeeze(), delta)
-        #loss = self.RMSE(logits.squeeze(), fut_rea_vol, 1 / (fut_rea_vol)**2)
-        loss = F.binary_cross_entropy_with_logits(logits.squeeze(), upordown, weight = 1 / (fut_rea_vol)**2)
+        loss = self.RMSE(logits.squeeze(), fut_rea_vol, 1 / (fut_rea_vol)**2)
+        #loss = F.binary_cross_entropy_with_logits(logits.squeeze(), upordown, weight = 1 / (fut_rea_vol)**2)
 
-        self.log('train_loss', loss)
+        self.log('train_loss', loss.item())
 
         return loss
 
@@ -99,12 +100,12 @@ class PatternFinder(LightningModule):
 
         series, maps, stats, targets = val_batch
 
-        increase     = targets[:,-1]
-        delta        = targets[:,-2]
-        past_rea_vol = targets[:,-3]
+        # increase     = targets[:,-1]
+        # delta        = targets[:,-2]
+        # past_rea_vol = targets[:,-3]
         fut_rea_vol  = targets[:,-4]
 
-        upordown = ((targets[:,-1]>0)*1).float()
+        #upordown = ((targets[:,-1]>0)*1).float()
 
         #TODO: nograd needed?
 
@@ -113,44 +114,40 @@ class PatternFinder(LightningModule):
 
         #loss = torch.sqrt(torch.mean(torch.square((fut_rea_vol - logits.squeeze()) / fut_rea_vol), dim=0)).cpu().item()
         #loss = self.loss(logits.squeeze(), delta).cpu().item()
-        #loss = self.RMSE(logits.squeeze(), fut_rea_vol, 1 / (fut_rea_vol)**2).cpu().item()
-        loss = F.binary_cross_entropy_with_logits(logits.squeeze(), upordown, weight = 1 / (fut_rea_vol)**2)
+        loss = self.RMSE(logits.squeeze(), fut_rea_vol, 1 / (fut_rea_vol)**2).cpu().item()
+        #loss = F.binary_cross_entropy_with_logits(logits.squeeze(), upordown, weight = 1 / (fut_rea_vol)**2)
 
         self.log('val_loss', loss)
 
-        pred = torch.sigmoid(logits)
+        #pred = torch.sigmoid(logits)
+        # val_auc = roc_auc_score(y_true  = upordown.detach().cpu().squeeze(),
+        #                         y_score = pred.detach().cpu().squeeze())
+        # self.log('val_auc', val_auc)
 
-        val_auc = roc_auc_score(y_true  = upordown.detach().cpu().squeeze(),
-                                y_score = pred.detach().cpu().squeeze())
-
-        self.log('val_auc', val_auc)
-
-        # #fut_rea_vol_estim = past_rea_vol + logits.squeeze()
-        # fut_rea_vol_estim = logits.squeeze()
+        #fut_rea_vol_estim = past_rea_vol + logits.squeeze()
+        fut_rea_vol_estim = logits.squeeze()
         # val_increase_mae_estim = fut_rea_vol_estim / past_rea_vol - 1
         # val_increase_mae = torch.mean(torch.abs(val_increase_mae_estim - increase)).cpu().item()
 
-        # val_rmspe = torch.sqrt(torch.mean(torch.square((fut_rea_vol - fut_rea_vol_estim) / fut_rea_vol), dim=0)).cpu().item()
+        val_rmspe = torch.sqrt(torch.mean(torch.square((fut_rea_vol - fut_rea_vol_estim) / fut_rea_vol), dim=0)).cpu().item()
 
-        # self.log('val_increase_mae', val_increase_mae)
-        # self.log('val_rmspe', val_rmspe)
+        #self.log('val_increase_mae', val_increase_mae)
+        self.log('val_rmspe', val_rmspe)
 
-        # if batch_idx==0:
-        #     print()
-        #     print(  f'\033[93m-------',
-        #             'val_rmspe', np.round(val_rmspe,3),
-        #             '| val_loss', np.round(loss,7),
-        #             '| val_increase_mae',np.round(val_increase_mae,2),
-        #             '| mean(real_increase)',np.round(torch.mean(torch.abs(increase)).cpu().item(),2),
-        #             'median(real_increase)',np.round(torch.median(torch.abs(increase)).cpu().item(),2),
-        #             f'-------\033[0m')
+        return val_rmspe
 
+    def validation_epoch_end(self, validation_step_outputs):
+
+        print()
+        print(  f'\033[93m-------',
+                'val_rmspe', np.round(np.mean(validation_step_outputs),4),
+                f'-------\033[0m')
 
     def configure_optimizers(self):
 
-        optimizer = torch.optim.Adam(self.parameters(), lr=1e-2)
-        sccheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', patience=3, factor=1/5, verbose=True, min_lr=1e-6)
-        return [optimizer], {'scheduler': sccheduler, 'monitor': 'val_auc'}
+        optimizer = torch.optim.Adam(self.parameters(), lr=3e-3)
+        sccheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=3, factor=1/4, verbose=True, min_lr=7e-7)
+        return [optimizer], {'scheduler': sccheduler, 'monitor': 'val_rmspe'}
 
 
 
@@ -173,16 +170,16 @@ class Dablock(LightningModule):
         self.conv00 = nn.Conv1d(in_channels, in_channels*multf, kernel_size=kernel_size, dilation=dilation)
         #self.conv01 = nn.Conv1d(in_channels*multf, in_channels*multf, kernel_size=kernel_size, dilation=dilation)
 
-        self.conv10 = nn.Conv1d(in_channels*multf, in_channels*multf*2, kernel_size=kernel_size, dilation=dilation**2)
+        self.conv10 = nn.Conv1d(in_channels*multf, in_channels*multf, kernel_size=kernel_size, dilation=dilation)
         #self.conv11 = nn.Conv1d(in_channels*multf*2, in_channels*multf*2, kernel_size=kernel_size, dilation=dilation**2)
 
-        self.conv20 = nn.Conv1d(in_channels*multf*2, in_channels*multf*3, kernel_size=kernel_size, dilation=dilation**3)
+        self.conv20 = nn.Conv1d(in_channels*multf, in_channels*multf, kernel_size=kernel_size, dilation=dilation)
         #self.conv21 = nn.Conv1d(in_channels*multf*3, in_channels*multf*3, kernel_size=kernel_size, dilation=dilation**3)
 
-        self.conv30 = nn.Conv1d(in_channels*multf*3, in_channels*multf*4, kernel_size=kernel_size)
+        self.conv30 = nn.Conv1d(in_channels*multf, in_channels*multf, kernel_size=kernel_size, dilation=dilation)
         #self.conv31 = nn.Conv1d(in_channels*multf*4, in_channels*multf*4, kernel_size=kernel_size)
 
-        #self.conv3b = nn.Conv1d(in_channels*multf*3, in_channels*multf*4, kernel_size=3, stride=3, bias=True)
+        self.conv30d = nn.Conv1d(in_channels*multf, in_channels*multf, kernel_size=kernel_size, dilation=dilation)
 
     def channel_dropout(self, x):
 
@@ -221,13 +218,23 @@ class Dablock(LightningModule):
         #x = self.channel_dropout(x)
 
         if self.dilation == 1:
-            #x = self.batchnorm2(x)
+            #x = self.batchnorm3(x)
             x = self.conv30(x)
             x = F.leaky_relu(x)
             # x = self.conv31(x)
             # x = F.leaky_relu(x)
             x = F.avg_pool1d(x, kernel_size=3, stride=3)
             #x = self.channel_dropout(x)
+        elif self.dilation == 2:
+            #x = self.batchnorm3(x)
+            x = self.conv30d(x)
+            x = F.leaky_relu(x)
+            x = F.avg_pool1d(x, kernel_size=2, stride=2)
+            #x = self.channel_dropout(x)
+        elif self.dilation == 3:
+            x = F.leaky_relu(x)
+            x = F.avg_pool1d(x, kernel_size=3, stride=2)
+
 
         #x = self.batchnorm3(x)
         # if self.dilation == 1:
