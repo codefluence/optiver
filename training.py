@@ -1,6 +1,8 @@
 import math
 from datetime import datetime
 import os
+import json
+from tqdm import tqdm
 
 import torch
 import numpy as np
@@ -12,7 +14,8 @@ from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pytorch_lightning.callbacks import ModelCheckpoint
 
 from data import OptiverDataModule
-from model import VolatilityClassifier, PatternFinder
+from model1 import PatternFinder1
+from model2 import PatternFinder2
 
 def fit_model(CV_split):
 
@@ -27,16 +30,13 @@ def fit_model(CV_split):
 
     data = OptiverDataModule(CV_split=CV_split)
 
-    model = PatternFinder(  in_channels = data.series.shape[1],
-                            medians = data.series_medians)
-
-    #model = VolatilityClassifier(data.stats.shape[1])
+    model = PatternFinder1(in_channels = data.series.shape[1])
 
     filename = 'optiver_CV5'+str(CV_split)
     dirpath='./checkpoints/'
 
     early_stop_callback = EarlyStopping(
-        monitor='val_monit',
+        monitor='val_rmspe',
         patience=8,
         verbose=True,
         mode='min',
@@ -48,7 +48,7 @@ def fit_model(CV_split):
         filename=filename,
         save_top_k=1,
         verbose=True,
-        monitor='val_monit',
+        monitor='val_rmspe',
         mode='min'
     )
 
@@ -60,34 +60,48 @@ def fit_model(CV_split):
     trainer.fit(model, data)
 
 
-def eval_model(CV_split, device='cuda'):
+def eval_models(settings_path='./settings.json', device='cuda'):
 
-    data = OptiverDataModule()
+    with open(settings_path) as f:
+        
+        settings = json.load(f)
 
-    model = PatternFinder.load_from_checkpoint('./checkpoints/optiver_CV5{}.ckpt'.format(CV_split), in_channels=data.series.shape[1])
-
-    model.to(device)
-    model.eval()
+    data = OptiverDataModule(scale=False)
 
     output = np.zeros(len(data.series))
-    output[:] = np.nan
 
-    batch_size = 2**14
-    num_batches = math.ceil(len(data.series) / batch_size)
+    NUM_MODELS = 5
 
-    for bidx in range(num_batches):
+    for i in range(NUM_MODELS):
 
-        start = bidx*batch_size
-        end   = start + min(batch_size, len(data.series) - start)
-        print(start,end)
+        print('model:',i)
 
-        if start == end:
-            break
+        semf_np = np.load(settings['PREPROCESS_DIR'] + 'series_means_{}.npy'.format(i))
+        sesf_np = np.load(settings['PREPROCESS_DIR'] + 'series_stds_{}.npy'.format(i))
 
-        output[start:end]= model(torch.tensor(data.series[start:end], dtype=torch.float32, device=device))[0].detach().cpu().numpy().squeeze()
+        model = PatternFinder1.load_from_checkpoint('./checkpoints/optiver_CV5{}.ckpt'.format(i), in_channels=data.series.shape[1])
 
-    fut_rea_vol = torch.tensor(data.targets[:,3], dtype=torch.float32).cuda()
-    predictions = torch.tensor(output, dtype=torch.float32).cuda()
+        model.to(device)
+        model.eval()
+
+        batch_size = 2**13
+        num_batches = math.ceil(len(data.series) / batch_size)
+
+        for bidx in tqdm(range(num_batches)):
+
+            start = bidx*batch_size
+            end   = start + min(batch_size, len(data.series) - start)
+
+            if start == end:
+                break
+
+            mminput = data.series[start:end] - semf_np
+            mminput = mminput / sesf_np
+
+            output[start:end] += model(torch.tensor(mminput, dtype=torch.float32, device=device)).detach().cpu().numpy().squeeze()
+
+    fut_rea_vol = torch.tensor(data.targets[:,3], dtype=torch.float32).to(device)
+    predictions = torch.tensor(output/NUM_MODELS, dtype=torch.float32).to(device)
     evaluation = torch.sqrt(torch.mean(torch.square((fut_rea_vol - predictions) / fut_rea_vol), dim=0))
     print('result:',round(evaluation.item(),3))
 
@@ -97,4 +111,9 @@ def eval_model(CV_split, device='cuda'):
 
 if __name__ == '__main__':
 
-    fit_model(0)
+    # for i in range(5):
+    #     print('model:',i)
+    #     fit_model(CV_split=i)
+
+    eval_models()
+
