@@ -32,7 +32,7 @@ pd.set_option('display.max_rows', 600)
 class OptiverDataModule(pl.LightningDataModule):
 
     def __init__(self, settings_path='./settings.json', device='cuda', batch_size=50000, scale=True,
-                 kernel_size=5, stride=5, mks=30, CV_split=0, end_clip=30):
+                 kernel_size=3, stride=2, mks=30, CV_split=0, end_clip=0, fixed_length=300):
 
         super(OptiverDataModule, self).__init__()
 
@@ -65,9 +65,12 @@ class OptiverDataModule(pl.LightningDataModule):
         assert((~np.isfinite(series[:,-2:])).sum() == 0)
 
 
+
         # Reduce the number of series for the experiments
-        # series  = series[::2]
-        # targets = targets[::2]
+        sirtride=2
+        series  = series[::sirtride]
+        targets = targets[::sirtride]
+
 
 
         print('computing stock stats...')
@@ -247,10 +250,8 @@ class OptiverDataModule(pl.LightningDataModule):
             ##########################################################################################################
 
             WAP = (bid_px1*ask_qty1 + ask_px1*bid_qty1) / (bid_qty1 + ask_qty1)
-            process(WAP, [2])#4?
 
             WAP_returns = torch_diff(torch.log(WAP))
-            process(WAP_returns,[2,3])#4?
 
             # past realized volatility
             past_real_vol[start:end] = torch.sqrt(torch.sum(torch.pow(WAP_returns,2),dim=1)).cpu().numpy()
@@ -259,7 +260,7 @@ class OptiverDataModule(pl.LightningDataModule):
             w_avg_ask_price = (ask_px1*ask_qty1 + ask_px2*ask_qty2) / t_ask_size
 
             deepWAP = (w_avg_bid_price * t_ask_size + w_avg_ask_price * t_bid_size) / (t_bid_size + t_ask_size)
-
+            
             midprice = (bid_px1 + ask_px1) / 2
 
             executed_px = torch.tensor(series[start:end,8], device=device)
@@ -274,30 +275,35 @@ class OptiverDataModule(pl.LightningDataModule):
             VWAP = torch.sum(money_flows_windows, axis=2) / torch.sum(executed_qty_windows, axis=2)
             VWAP = torch.tensor(pd.DataFrame(VWAP.cpu().numpy()).ffill(axis=1).values, device=device)
             VWAP = torch_nan_to_num(VWAP) + torch.isnan(VWAP) * torch_nan_to_num(WAP[:,-VWAP.shape[1]:])  # for the beginning of the series
-            process(WAP, [2])
-
             VWAP_returns = torch_diff(torch.log(VWAP))
-            process(VWAP_returns,[2,3])#4?
+
+            pi = [2,4]#5 es sensible al price unit? parece que no ayuda
+            process(WAP, pi)
+            process(VWAP, pi)
+            process(deepWAP, pi)
+            process(midprice, pi)
+            process(executed_px, pi)
+
+            #returns 2 seguro; parece que 0 mejora un poco; 4 parece que muy poco
+            ri = [0,2]
+            process(WAP_returns,ri)
+            process(VWAP_returns,ri)
+            process(torch_diff(torch.log(deepWAP)),ri)
+            process(torch_diff(torch.log(midprice)),ri)
+            process(torch_diff(torch.log(executed_px)),ri)
 
             del money_flows_windows
             del executed_qty_windows
 
-            #spreads
-            process(ask_px1 / bid_px1 - 1, [0,1,2,3,4])
-            process(deepWAP / WAP - 1, [2,3]) #0,1 un poquito
-            process(VWAP / WAP[:,-VWAP.shape[1]:] - 1, [2,3]) #0,1 un poquito
-            process(midprice / WAP - 1, [2,3]) #0,1 un poquito
-            process(executed_px / WAP - 1, [2,3]) #0,1 un poquito
+            #spreads 0 seguro; all?
+            process(ask_px1 / bid_px1 - 1, [0,2,3,4])#4 parece que no ayuda mucho
 
-            #returns gaps
-            st = [2,3]
-            process(VWAP_returns - WAP_returns[:,-VWAP_returns.shape[1]:], st)
-            process(torch_diff(torch.log(deepWAP)) - WAP_returns, st)
-            process(torch_diff(torch.log(midprice)) - WAP_returns, st)
-            process(torch_diff(torch.log(executed_px)) - WAP_returns, st)
+            # comentar o descomentar, pero no tocar el toinclude - no esta claro si ayuda o no
+            # process(deepWAP / WAP - 1, [0])
+            # process(VWAP / WAP[:,-VWAP.shape[1]:] - 1, [0])
+            # process(midprice / WAP - 1, [0])
+            # process(executed_px / WAP - 1, [0])
             
-            #TODO: returns de todos los precios?
-
             del bid_px1
             del ask_px1
             del bid_qty1
@@ -371,7 +377,7 @@ class OptiverDataModule(pl.LightningDataModule):
 
             # # Inspired on https://www.investopedia.com/terms/u/ulcerindex.asp
             R = torch.pow(100 * (WAP[:,-WAP_rolling_max.shape[1]:] - WAP_rolling_max) / WAP_rolling_max, 2)
-            #process(R,[0,4])
+            process(R,[0])
 
             # # Inspired on https://www.investopedia.com/articles/trading/08/accumulation-distribution-line.asp
             # CLV = ((executed_px[:,-WAP_rolling_min.shape[1]:] - WAP_rolling_min) - (WAP_rolling_max - executed_px[:,-WAP_rolling_max.shape[1]:])) /   \
@@ -405,19 +411,34 @@ class OptiverDataModule(pl.LightningDataModule):
             del WAP #TODO: antes?
 
 
-            lengths = [102 + end_clip//stride]#TODO
+            lengths = []
 
             for s in batch_series:
+                # if start==0:
+                #     print(s.shape[1])
                 lengths.append(s.shape[1])
 
             for m in batch_maps:
                 lengths.append(m.shape[2])
 
+            if start==0:
+                print('min length found:',min(lengths))
+                print('max length found:',max(lengths))
+
             for i in range(len(batch_series)):
-                batch_series[i] = batch_series[i][:,-min(lengths):-end_clip//stride]  #TODO
+
+                excess = batch_series[i].shape[1] - fixed_length
+
+                if excess < 0:
+                
+                    backf = np.tile(batch_series[i][:,0:1],(1,-excess))
+                    batch_series[i] = np.concatenate((backf,batch_series[i]),axis=-1)
+                
+                else:
+                    batch_series[i] = batch_series[i][:,-fixed_length:]  #TODO
 
             for i in range(len(batch_maps)):
-                batch_maps[i] = batch_maps[i][:,:,-min(lengths):-end_clip//stride]  #TODO
+                batch_maps[i] = batch_maps[i][:,:,-fixed_length:]  #TODO
 
             processed_series.append(np.stack(batch_series, axis=1))
             processed_maps.append(np.stack(batch_maps, axis=1))
@@ -483,16 +504,6 @@ class OptiverDataModule(pl.LightningDataModule):
                     
              )))
 
-            # corrs = np.corrcoef(np.hstack((statos[-1], np.expand_dims(targets[:,-1],1))).T)[:-1,-1]
-            # print('corrs for last {} ticks:\t'.format(r//d), np.round(corrs,2))
-
-        # corrs = np.corrcoef(np.hstack((statos[2]-statos[0], np.expand_dims(targets[:,-1],1))).T)[:-1,-1]
-        # print('corrs for {} ti - {} ti:\t'.format(r//ds[2], r//ds[0]), np.round(corrs,2))
-        # corrs = np.corrcoef(np.hstack((statos[2]-statos[1], np.expand_dims(targets[:,-1],1))).T)[:-1,-1]
-        # print('corrs for {} ti - {} ti:\t'.format(r//ds[2], r//ds[1]), np.round(corrs,2))
-        # corrs = np.corrcoef(np.hstack((statos[1]-statos[0], np.expand_dims(targets[:,-1],1))).T)[:-1,-1]
-        # print('corrs for {} ti - {} ti:\t'.format(r//ds[1], r//ds[0]), np.round(corrs,2))
-
         stats = []
         stats.append(execqty_sum.reshape(-1,1))
         stats.append(execcount_sum.reshape(-1,1))
@@ -514,61 +525,50 @@ class OptiverDataModule(pl.LightningDataModule):
 
         print('scaling...')
 
+        #series = series - np.median(series, axis=0)
+
         idx_train = stock_id % 5 != CV_split
 
-        if scale and len(series) > 1:
+        stmf = settings['PREPROCESS_DIR'] + 'stats_means_{}.npy'.format(CV_split)
+        stsf = settings['PREPROCESS_DIR'] + 'stats_stds_{}.npy'.format(CV_split)
+        semf = settings['PREPROCESS_DIR'] + 'series_means_{}.npy'.format(CV_split)
+        sesf = settings['PREPROCESS_DIR'] + 'series_stds_{}.npy'.format(CV_split)
+        mamf = settings['PREPROCESS_DIR'] + 'maps_means_{}.npy'.format(CV_split)
+        masf = settings['PREPROCESS_DIR'] + 'maps_stds_{}.npy'.format(CV_split)
 
-            stmf = settings['PREPROCESS_DIR'] + 'stats_means_{}.npy'.format(CV_split)
-            stsf = settings['PREPROCESS_DIR'] + 'stats_stds_{}.npy'.format(CV_split)
-            semf = settings['PREPROCESS_DIR'] + 'series_means_{}.npy'.format(CV_split)
-            sesf = settings['PREPROCESS_DIR'] + 'series_stds_{}.npy'.format(CV_split)
-            mamf = settings['PREPROCESS_DIR'] + 'maps_means_{}.npy'.format(CV_split)
-            masf = settings['PREPROCESS_DIR'] + 'maps_stds_{}.npy'.format(CV_split)
+        if settings['ENV'] == 'train':
 
-            if settings['ENV'] == 'train':
+            series_means = np.expand_dims(np.mean(series[idx_train], axis=(0,2)),1)
+            series_stds = np.expand_dims(np.std(series[idx_train], axis=(0,2)),1)
 
-                stats_means = np.mean(stats[idx_train], axis=0)
-                stats_stds = np.std(stats[idx_train], axis=0)
+            assert((~np.isfinite(series_means)).sum() == 0)
+            assert((~np.isfinite(series_stds)).sum() == 0)
+            np.save(semf, series_means)
+            np.save(sesf, series_stds)
+        else:
 
-                np.save(stmf, stats_means)
-                np.save(stsf, stats_stds)
-            else:
+            series_means = np.load(semf)
+            series_stds  = np.load(sesf)
 
-                stats_means = np.load(stmf)
-                stats_stds  = np.load(stsf)
+        series = (series - series_means) / series_stds
 
-            stats = (stats - stats_means) / stats_stds
+        # if settings['ENV'] == 'train':
 
-            if settings['ENV'] == 'train':
+        #     maps_means = np.expand_dims(np.mean(maps[idx_train], axis=(0,2,3)),1)
+        #     maps_stds = np.expand_dims(np.std(maps[idx_train], axis=(0,2,3)),1)
 
-                series_means = np.expand_dims(np.mean(series[idx_train], axis=(0,2)),1)
-                series_stds = np.expand_dims(np.std(series[idx_train], axis=(0,2)),1)
+        #     assert((~np.isfinite(maps_means)).sum() == 0)
+        #     assert((~np.isfinite(maps_stds)).sum() == 0)
+        #     np.save(mamf, maps_means)
+        #     np.save(masf, maps_stds)
+        # else:
 
-                np.save(semf, series_means)
-                np.save(sesf, series_stds)
-            else:
+        #     maps_means = np.load(mamf)
+        #     maps_stds  = np.load(masf)
 
-                series_means = np.load(semf)
-                series_stds  = np.load(sesf)
-
-            series = (series - series_means) / series_stds
-
-            if settings['ENV'] == 'train':
-
-                maps_means = np.expand_dims(np.mean(maps[idx_train], axis=(0,2,3)),1)
-                maps_stds = np.expand_dims(np.std(maps[idx_train], axis=(0,2,3)),1)
-
-                np.save(mamf, maps_means)
-                np.save(masf, maps_stds)
-            else:
-
-                maps_means = np.load(mamf)
-                maps_stds  = np.load(masf)
-
-            maps = (maps - np.expand_dims(maps_means,1)) / np.expand_dims(maps_stds,1)
+        # maps = (maps - np.expand_dims(maps_means,1)) / np.expand_dims(maps_stds,1)
 
         assert((~np.isfinite(series)).sum() == 0)
-        assert((~np.isfinite(series_means)).sum() == 0)
         assert((~np.isfinite(stats)).sum() == 0)
         
         self.series = series
@@ -593,12 +593,12 @@ class OptiverDataModule(pl.LightningDataModule):
 
         #TODO: sorting por volatilidad
         idx = self.targets[:,0] % 5 != self.CV_split
-        return DataLoader(SeriesDataSet(self.series[idx], self.maps[idx], self.stats[idx], self.targets[idx]), batch_size=4096, shuffle=True)
+        return DataLoader(SeriesDataSet(self.series[idx], self.maps[idx], self.stats[idx], self.targets[idx]), batch_size=512, shuffle=True)
 
     def val_dataloader(self):
 
         idx = self.targets[:,0] % 5 == self.CV_split
-        return DataLoader(SeriesDataSet(self.series[idx], self.maps[idx], self.stats[idx], self.targets[idx]), batch_size=4096*4, shuffle=False)
+        return DataLoader(SeriesDataSet(self.series[idx], self.maps[idx], self.stats[idx], self.targets[idx]), batch_size=1024, shuffle=False)
 
 
 

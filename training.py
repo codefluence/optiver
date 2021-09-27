@@ -1,5 +1,6 @@
 import math
 from datetime import datetime
+import os
 
 import torch
 import numpy as np
@@ -13,40 +14,33 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 from data import OptiverDataModule
 from model import VolatilityClassifier, PatternFinder
 
-from net1d import Net1D
-from resnet1d import ResNet1D
-
 def fit_model(CV_split):
+
+    torch.cuda.manual_seed(0)
+    torch.manual_seed(0)
+    np.random.seed(0)
+    pl.utilities.seed.seed_everything(0)
+
+    # torch.backends.cudnn.benchmark = False
+    # pl.utilities.seed.seed_everything(0)
+    # os.environ["CUBLAS_WORKSPACE_CONFIG"]=":4096:8"
 
     data = OptiverDataModule(CV_split=CV_split)
 
-    model = PatternFinder(  in_channels=data.series.shape[1],
-                            maps_num=data.maps.shape[1],
-                            stats_num=data.stats.shape[1],
-                            series_medians=data.series_medians)
+    model = PatternFinder(  in_channels = data.series.shape[1],
+                            medians = data.series_medians)
 
     #model = VolatilityClassifier(data.stats.shape[1])
-    # model = ResNet1D(
-    #                     in_channels=15, 
-    #                     base_filters=15, 
-    #                     kernel_size=3, 
-    #                     stride=2, 
-    #                     n_block=4, 
-    #                     groups=3,
-    #                     n_classes=1, 
-    #                     downsample_gap=max(3//8, 1), 
-    #                     increasefilter_gap=max(3//4, 1), 
-    #                     verbose=False)
 
     filename = 'optiver_CV5'+str(CV_split)
     dirpath='./checkpoints/'
 
     early_stop_callback = EarlyStopping(
-        monitor='val_rmspe',
-        patience=15,
+        monitor='val_monit',
+        patience=8,
         verbose=True,
         mode='min',
-        min_delta=0.0002
+        min_delta=0.0001
     )
 
     checkpoint_callback = ModelCheckpoint(
@@ -54,20 +48,15 @@ def fit_model(CV_split):
         filename=filename,
         save_top_k=1,
         verbose=True,
-        monitor='val_rmspe',
+        monitor='val_monit',
         mode='min'
     )
 
     trainer = pl.Trainer(   logger=pl_loggers.TensorBoardLogger('./logs/'),
                             gpus=1,
-                            max_epochs=1000,
+                            max_epochs=100,
                             checkpoint_callback=True,
                             callbacks=[early_stop_callback,checkpoint_callback] )
-
-    #TODO: torch.use_deterministic_algorithms(True)
-    torch.manual_seed(0)
-    np.random.seed(0)
-
     trainer.fit(model, data)
 
 
@@ -77,7 +66,7 @@ def eval_model(CV_split, device='cuda'):
 
     model = PatternFinder.load_from_checkpoint('./checkpoints/optiver_CV5{}.ckpt'.format(CV_split), in_channels=data.series.shape[1])
 
-    model.cuda()
+    model.to(device)
     model.eval()
 
     output = np.zeros(len(data.series))
@@ -97,10 +86,10 @@ def eval_model(CV_split, device='cuda'):
 
         output[start:end]= model(torch.tensor(data.series[start:end], dtype=torch.float32, device=device))[0].detach().cpu().numpy().squeeze()
 
-    targets = torch.tensor(data.targets[:,-1], dtype=torch.float32).cuda()
+    fut_rea_vol = torch.tensor(data.targets[:,3], dtype=torch.float32).cuda()
     predictions = torch.tensor(output, dtype=torch.float32).cuda()
-    evaluation = torch.sqrt(torch.mean(torch.square((targets - predictions) / targets), dim=0))
-    print(evaluation)
+    evaluation = torch.sqrt(torch.mean(torch.square((fut_rea_vol - predictions) / fut_rea_vol), dim=0))
+    print('result:',round(evaluation.item(),3))
 
     row_ids = pd.Series(data.targets[:,0].astype('int').astype('str')) + '-' + pd.Series(data.targets[:,1].astype('int').astype('str'))
     submission = pd.DataFrame({ 'row_id': row_ids, 'target': predictions.detach().cpu().numpy() })
@@ -109,4 +98,3 @@ def eval_model(CV_split, device='cuda'):
 if __name__ == '__main__':
 
     fit_model(0)
-
