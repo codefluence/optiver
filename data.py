@@ -490,7 +490,11 @@ class OptiverDataModule(pl.LightningDataModule):
 
         fut_rea_vol = targets[:,3]
         rea_vol_delta = fut_rea_vol - past_real_vol
+
         rea_vol_increase = fut_rea_vol / past_real_vol - 1
+        # rea_vol_increase = np.abs(rea_vol_increase)
+        # np.clip(rea_vol_increase, 0, 0.5, out=rea_vol_increase)
+        # rea_vol_increase = rea_vol_increase + 0.15
 
         targets = np.hstack((   targets,
                                 np.expand_dims(past_real_vol,1),
@@ -551,7 +555,7 @@ class OptiverDataModule(pl.LightningDataModule):
 
             # stmf = settings['PREPROCESS_DIR'] + 'stats_means_{}.npy'.format(CV_split)
             # stsf = settings['PREPROCESS_DIR'] + 'stats_stds_{}.npy'.format(CV_split)
-            # seaf = settings['PREPROCESS_DIR'] + 'series_channel_medians_{}.npy'.format(CV_split)
+            #seaf = settings['PREPROCESS_DIR'] + 'series_channel_medians_{}.npy'.format(CV_split)
             semf = settings['PREPROCESS_DIR'] + 'series_means_{}.npy'.format(CV_split)
             sesf = settings['PREPROCESS_DIR'] + 'series_stds_{}.npy'.format(CV_split)
             # mamf = settings['PREPROCESS_DIR'] + 'maps_means_{}.npy'.format(CV_split)
@@ -561,7 +565,7 @@ class OptiverDataModule(pl.LightningDataModule):
 
                 print('saving scaling files...')
 
-                # series_channel_medians = np.median(series, axis=0)
+                # series_channel_medians = np.median(series[idx_train], axis=0)
                 # np.save(seaf, series_channel_medians)
                 # assert((~np.isfinite(series_channel_medians)).sum() == 0)
                 # series = series - series_channel_medians
@@ -570,14 +574,13 @@ class OptiverDataModule(pl.LightningDataModule):
                 series_means = np.expand_dims(np.mean(series[idx_train], axis=(0,2)),1)
                 np.save(semf, series_means)
                 #assert((~np.isfinite(series_means)).sum() == 0)
+                series = series - series_means
+                del series_means
 
                 series_stds = np.expand_dims(np.std(series[idx_train], axis=(0,2)),1)
                 np.save(sesf, series_stds)
                 #assert((~np.isfinite(series_stds)).sum() == 0)
-
-                series = series - series_means
                 series = series / series_stds
-                del series_means
                 del series_stds
 
             else:

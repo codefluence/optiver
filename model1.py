@@ -76,8 +76,8 @@ class PatternFinder1(LightningModule):
 
         logits = self.forward(series)
 
-        loss = torch.sqrt(torch.mean(torch.square((fut_rea_vol - logits.squeeze()) / fut_rea_vol), dim=0))
-        #loss = self.RMSE(logits.squeeze(), fut_rea_vol, 1 / (fut_rea_vol)**2)
+        weights = targets[:,-1]
+        loss = self.RMSE(logits.squeeze(), fut_rea_vol, weights)
 
         self.log('train_loss', loss.cpu().item())
 
@@ -90,8 +90,8 @@ class PatternFinder1(LightningModule):
 
         logits = self.forward(series)
 
-        loss = torch.sqrt(torch.mean(torch.square((fut_rea_vol - logits.squeeze()) / fut_rea_vol), dim=0))
-        #loss = self.RMSE(logits.squeeze(), fut_rea_vol, 1 / (fut_rea_vol)**2)
+        weights = targets[:,-1]
+        loss = self.RMSE(logits.squeeze(), fut_rea_vol, weights)
 
         val_rmspe = torch.sqrt(torch.mean(torch.square((fut_rea_vol - logits.squeeze()) / fut_rea_vol), dim=0)).cpu().item()
 

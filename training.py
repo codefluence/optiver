@@ -40,7 +40,7 @@ def fit_model(CV_split):
         patience=8,
         verbose=True,
         mode='min',
-        min_delta=0.0001
+        min_delta=0.0003
     )
 
     checkpoint_callback = ModelCheckpoint(
@@ -111,9 +111,9 @@ def eval_models(settings_path='./settings.json', device='cuda'):
 
 if __name__ == '__main__':
 
-    # for i in range(5):
-    #     print('model:',i)
-    #     fit_model(CV_split=i)
+    for i in range(5):
+        print('model:',i)
+        fit_model(CV_split=i)
 
     eval_models()
 

@@ -19,49 +19,57 @@ class PatternFinder2(LightningModule):
 
         self.batch_norm = nn.BatchNorm1d(in_channels)
 
-        self.block00 = Dablock_ks3_notpooling(8, multf)
+        self.block00 = Dablock_ks3_notpooling(10, multf)
         self.block01 = Dablock_ks3_notpooling(10, multf)
-        self.block02 = Dablock_ks3_notpooling(10, multf)
+        self.block02 = Dablock_ks3_notpooling(7, multf)
 
-        self.block10 = Dablock_dilation_nopooling(8, multf)
+        self.block10 = Dablock_dilation_nopooling(10, multf)
         self.block11 = Dablock_dilation_nopooling(10, multf)
-        self.block12 = Dablock_dilation_nopooling(10, multf)
+        self.block12 = Dablock_dilation_nopooling(7, multf)
 
-        self.block_m0 = Dablock_merge(14, multf)
-        self.block_m1 = Dablock_merge(14, multf)
+        self.block_m0 = Dablock_merge(13, multf)
+        self.block_m1 = Dablock_merge(13, multf)
 
-        input_width = 56 * 4 * 2
+        input_width = 52 * 6 * 2
 
         self.linear = nn.Linear(input_width, 1)
+
+    def RMSE(self, input, target, weight):
+
+        return torch.sqrt(torch.sum(weight * (input - target)**2) / torch.sum(weight))
 
     def forward(self, series, stats):
 
         series = self.batch_norm(series)
 
-        x00 = self.block00(series[:,:8])
-        x01 = self.block01(series[:,8:18])
-        x02 = self.block02(series[:,-10:])
+        c0=10
+        c1=10+c0
+        c2=7+c1
+
+        x00 = self.block00(series[:,:c0])
+        x01 = self.block01(series[:,c0:c1])
+        x02 = self.block02(series[:,c1:c2])
 
         x0 = torch.cat((x00,x01,x02),dim=1)
         x0 = self.block_m0(x0)
 
-        x10 = self.block10(series[:,:8])
-        x11 = self.block11(series[:,8:18])
-        x12 = self.block12(series[:,-10:])
+        x10 = self.block10(series[:,:c0])
+        x11 = self.block11(series[:,c0:c1])
+        x12 = self.block12(series[:,c1:c2])
 
-        x1 = torch.cat((x10,x11,x12),dim=1)
+        x1 = torch.cat((x10,x11,x12, ),dim=1)
         x1 = self.block_m1(x1)
 
         x = torch.hstack((x0,x1))
 
-        return self.linear(x), x
+        return self.linear(x)
 
     def training_step(self, train_batch, batch_idx):
 
-        series, _, stats, targets = train_batch
+        series, stats, targets = train_batch
         fut_rea_vol = targets[:,-4]
 
-        logits = self.forward(series, stats)[0]
+        logits = self.forward(series, stats)
 
         #loss = torch.sqrt(torch.mean(torch.square((targets[:,-4] - logits.squeeze()) / targets[:,-4]), dim=0))
         loss = self.RMSE(logits.squeeze(), fut_rea_vol, 1 / (fut_rea_vol)**2)
@@ -72,10 +80,10 @@ class PatternFinder2(LightningModule):
 
     def validation_step(self, val_batch, batch_idx):
 
-        series, _, stats, targets = val_batch
+        series, stats, targets = val_batch
         fut_rea_vol = targets[:,-4]
 
-        logits = self.forward(series, stats)[0]  #,stats.reshape(-1,1)
+        logits = self.forward(series, stats)
 
         #loss = torch.sqrt(torch.mean(torch.square((targets[:,-4] - logits.squeeze()) / targets[:,-4]), dim=0))
         loss = self.RMSE(logits.squeeze(), fut_rea_vol, 1 / (fut_rea_vol)**2)
@@ -88,8 +96,8 @@ class PatternFinder2(LightningModule):
 
     def configure_optimizers(self):
 
-        optimizer = torch.optim.Adam(self.parameters(), lr=3e-3)
-        sccheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=2, factor=1/3, verbose=True, min_lr=1e-5)
+        optimizer = torch.optim.Adam(self.parameters(), lr=2e-3)
+        sccheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=1, factor=1/4, verbose=True, min_lr=1e-5)
         return [optimizer], {'scheduler': sccheduler, 'monitor': 'val_rmspe'}
 
 class Dablock_ks3_notpooling(LightningModule):
@@ -109,7 +117,7 @@ class Dablock_ks3_notpooling(LightningModule):
 
     def forward(self, series):
 
-        x = series[:,:,-296:]
+        x = series
 
         x = self.conv1(x)
         x = F.leaky_relu(x)
@@ -147,7 +155,7 @@ class Dablock_dilation_nopooling(LightningModule):
 
     def forward(self, series):
 
-        x = series[:,:,-295:]
+        x = series
 
         x = self.conv1(x)
         x = F.leaky_relu(x)
@@ -179,19 +187,19 @@ class Dablock_merge(LightningModule):
 
     def forward(self, series):
 
-        x = series[:,:,-278:]
+        x = series[:,:,-134:]
 
         x = self.conv1(x)
         x = F.leaky_relu(x)
-        x = F.avg_pool1d(x, kernel_size=3, stride=3)
+        x = F.avg_pool1d(x, kernel_size=2, stride=2)
 
         x = self.conv2(x)
         x = F.leaky_relu(x)
-        x = F.avg_pool1d(x, kernel_size=3, stride=3)
+        x = F.avg_pool1d(x, kernel_size=2, stride=2)
 
         x = self.conv3(x)
         x = F.leaky_relu(x)
-        x = F.avg_pool1d(x, kernel_size=7, stride=7)
+        x = F.avg_pool1d(x, kernel_size=5, stride=5)
 
         return torch.flatten(x, start_dim=1, end_dim=2)
 
